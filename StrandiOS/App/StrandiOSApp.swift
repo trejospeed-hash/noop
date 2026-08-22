@@ -199,13 +199,13 @@ struct StrandiOSApp: App {
                     guard WidgetSnapshot.HRPublishThrottle.admit() else { return }
                     Task { await WidgetSnapshot.publishLive(from: model) }
                 }
-                .onChange(of: effortScaleRaw) { _, _ in
+                .onChange(of: effortScaleRaw) { _ in
                     guard scenePhase == .active else { return }
                     Task { await WidgetSnapshot.publish(from: model) }
                 }
                 // Apple Health is explicitly opt-in. Once any write type is authorized, keep one
                 // best-effort BGAppRefresh request armed; revoking all write access cancels it.
-                .onChange(of: health.auth) { _, auth in
+                .onChange(of: health.auth) { auth in
                     HealthWritebackBackgroundScheduler.updateSchedule(isAuthorized: auth == .authorized)
                 }
                 // #581: the `noop://import-health` deep link the iOS Shortcut opens after building the
@@ -248,7 +248,7 @@ struct StrandiOSApp: App {
         // access (it only reads write/share status, never prompts) so background syncs resume; and
         // HealthKitBridge.sync guards on `auth == .authorized`, so the scenePhase trigger stays a
         // safe no-op until the user opts in.
-        .onChange(of: scenePhase) { _, phase in
+        .onChange(of: scenePhase) { phase in
             if phase == .active {
                 model.drainPendingIntents()
                 // Re-arm the strap's smart alarm on foreground: the firmware alarm is a single instant
@@ -373,7 +373,7 @@ private struct iOSRootView: View {
             // collects it even if the user dismisses the auto sheet.
             UpdateStore.shared.seedWhatsNewIfNeeded()
         }
-        .onChange(of: acceptedTerms) { _, _ in showWhatsNewIfDue() }
+        .onChange(of: acceptedTerms) { _ in showWhatsNewIfDue() }
     }
 
     /// DEBUG: launched with --demo-seed, skip the first-run gates (onboarding / terms / What's New) so the

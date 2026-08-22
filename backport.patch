@@ -1,0 +1,64 @@
+--- a/project.yml
++++ b/project.yml
+@@ -1,6 +1,6 @@
+ name: Strand
+ targets:
+   NOOPiOS:
+     type: application
+-    deploymentTarget: "17.0"
++    deploymentTarget: "16.3"
+     platform: iOS
+     sources:
+@@ -8,7 +8,7 @@
+       - path: Strand.xcassets
+       - path: Widgets
+   NOOPiOSWidgets:
+     type: extension
+-    deploymentTarget: "17.0"
++    deploymentTarget: "16.3"
+     platform: iOS
+     sources:
+
+--- a/Strand/Liquid/LiquidTodayView.swift
++++ b/Strand/Liquid/LiquidTodayView.swift
+@@ -412,7 +412,7 @@
+                     }
+                 }
+             }
+-     
+
+
+
+87
+88
+89
+90
+91
+92
+86
+
+
+
+
+
+
+
+
+
+
+                             }
+-                            .onChange(of: backgroundPickerItem) { newItem in
++                            .onChange(of: backgroundPickerItem) { _ in
+                                 guard let item = backgroundPickerItem else { return }
+                                 model.updateBackground(item)
+
+                                 model.updateAvatar(item)git apply backport.patch
+
+W
+w
+
+x
+X
+
+
+

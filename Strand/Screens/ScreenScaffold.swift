@@ -63,12 +63,6 @@ struct ScreenScaffold<Content: View, Trailing: View>: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             #endif
         }
-        #if os(iOS)
-        // #697: stop a vertical scroll from drifting/bouncing the screen left-right. `.basedOnSize` only
-        // permits horizontal bounce when content genuinely overflows the width (it does not here, the column
-        // is width-capped), so the spurious horizontal rubber-band that caused the sideways drift is gone.
-        .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
-        #endif
         // The flat canvas, plus an optional full-bleed TOP backdrop (Today's day-cycle scene) drawn behind
         // the scroll content — edge-to-edge under the status bar. The scene is CONFINED to the header+hero
         // band (see SceneScreenBackground.height) so it fades out ABOVE the dashboard cards, which then sit
@@ -89,7 +83,7 @@ struct ScreenScaffold<Content: View, Trailing: View>: View {
         #if os(iOS)
         // Scroll-to-top on an at-root tab re-tap (#198 follow-up). iOS-only: the tab shell is the only
         // driver, and gating here keeps the two-param onChange off macOS 13. Inert until the signal moves.
-        .onChange(of: scrollToTopSignal) { _, _ in
+        .onChange(of: scrollToTopSignal) { _ in
             withAnimation(.easeOut(duration: 0.35)) { proxy.scrollTo(screenScaffoldTopAnchorID, anchor: .top) }
         }
         #endif

@@ -192,7 +192,7 @@ targets:
   NOOPiOS:
     type: application
     platform: iOS
-    deploymentTarget: "17.0"
+    deploymentTarget: "16.3"
     sources:
       - path: Strand
         excludes:
@@ -337,7 +337,7 @@ targets:
   NOOPiOSWidgets:
     type: app-extension
     platform: iOS
-    deploymentTarget: "17.0"
+    deploymentTarget: "16.3"
     sources:
       - path: StrandiOSWidgets
         excludes:
@@ -436,7 +436,7 @@ targets:
       - package: StrandDesign
       - package: StrandAnalytics
       # The complication WidgetKit extension is embedded inside the watch app.
-      - target: NOOPWatchComplications
+      # - target: NOOPWatchComplications
 
   # WidgetKit complication extension for the watch face. Reads the same shared-App-Group
   # snapshot the watch app displays, so the complication + glance can never disagree.

@@ -412,7 +412,7 @@ struct LiquidTodayView: View {
         #endif
         #if os(iOS)
         // Scroll-to-top on an at-root Today re-tap (#198 follow-up); iOS-only — the tab shell is the only driver.
-        .onChange(of: scrollToTopSignal) { _, _ in
+        .onChange(of: scrollToTopSignal) { _ in
             withAnimation(.easeOut(duration: 0.35)) { proxy.scrollTo(Self.topAnchorID, anchor: .top) }
         }
         #endif

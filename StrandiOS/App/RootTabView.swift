@@ -164,7 +164,7 @@ struct RootTabView: View {
         }
         // Honour a router request: Devices keeps its dedicated sheet; the v5 pillars route through the
         // shared pillar sheet. Cleared so the same tap can fire again later.
-        .onChange(of: router.requestedDestination) { _, dest in
+        .onChange(of: router.requestedDestination) { dest in
             switch dest {
             case .devices:
                 showDevices = true
@@ -197,7 +197,7 @@ struct RootTabView: View {
             }
         }
         // A screen's top-bar "+" routes here: open the quick-action sheet, then clear the flag.
-        .onChange(of: router.quickActionsRequested) { _, req in
+        .onChange(of: router.quickActionsRequested) { req in
             if req {
                 withAnimation(Self.sheetEase) { quickAction = .menu }
                 router.quickActionsRequested = false
@@ -208,10 +208,10 @@ struct RootTabView: View {
         .onAppear {
             presentPendingHomeScreenQuickActionIfPossible()
         }
-        .onChange(of: homeScreenQuickActions.pendingAction) { _, _ in
+        .onChange(of: homeScreenQuickActions.pendingAction) { _ in
             presentPendingHomeScreenQuickActionIfPossible()
         }
-        .onChange(of: homeScreenQuickActionsEnabled) { _, _ in
+        .onChange(of: homeScreenQuickActionsEnabled) { _ in
             presentPendingHomeScreenQuickActionIfPossible()
         }
     }

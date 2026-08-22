@@ -130,14 +130,6 @@ struct IntervalTimerView: View {
         #if os(iOS)
         // iPhone haptics: one modifier emits a different feel per cue, re-firing on every
         // token bump. Fires regardless of strap bond so the timer is fully usable unstrapped.
-        .sensoryFeedback(trigger: hapticTick) { _, _ in
-            switch lastHaptic {
-            case .work: return .impact(weight: .heavy)      // strong cue into WORK
-            case .rest: return .impact(weight: .light)      // soft cue into REST
-            case .tick: return .selection                   // 3-2-1 countdown tick
-            case .done: return .success                     // session complete
-            }
-        }
         #endif
     }
 
