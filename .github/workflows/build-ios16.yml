@@ -2,89 +2,91 @@ name: Build iOS 16.3 IPA for TrollStore
 
 on:
   workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version tag (optional)'
-        required: false
-        default: 'latest'
   push:
-    tags:
-      - 'v*'
+    branches: [ main ]
+    tags: [ 'v*' ]
+
+permissions:
+  contents: write
 
 jobs:
   build:
-    runs-on: macos-14
-    
+    runs-on: macos-latest
     steps:
-    - name: Checkout code
+    - name: Checkout
       uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-    
-    - name: Install dependencies
+
+    - name: Select latest Xcode
       run: |
-        brew install xcodegen
-    
-    - name: Apply iOS 16.3 compatibility patches
+        sudo xcode-select -s "$(ls -d /Applications/Xcode*.app | sort -V | tail -1)/Contents/Developer"
+        xcodebuild -version
+
+    - name: Install XcodeGen
+      run: brew install xcodegen
+
+    - name: Apply iOS 16.3 patches
       run: |
-        echo "🔧 Applying iOS 16.3 patches..."
-        
-        # 1. Change deployment target
         sed -i '' 's/deploymentTarget: "17.0"/deploymentTarget: "16.3"/g' project.yml
-        
-        # 2. Remove watchOS dependency
-        sed -i '' '/^  - target: NOOPWatch$/s/^/#/' project.yml
-        
-        # 3. Fix sensoryFeedback in IntervalTimerView.swift
-        python3 << 'PYTHON'
-        with open('Strand/Screens/IntervalTimerView.swift', 'r') as f:
-            lines = f.readlines()
-        new_lines = []
-        for i, line in enumerate(lines, 1):
-            if 133 <= i <= 140:
-                continue
-            new_lines.append(line)
-        with open('Strand/Screens/IntervalTimerView.swift', 'w') as f:
-            f.writelines(new_lines)
-        print("✓ IntervalTimerView.swift patched")
-        PYTHON
-        
-        # 4. Fix ScreenScaffold.swift
-        python3 << 'PYTHON'
-        import re
-        with open('Strand/Screens/ScreenScaffold.swift', 'r') as f:
-            lines = f.readlines()
-        new_lines = []
-        skip_next_endif = False
-        for i, line in enumerate(lines):
-            if '#if os(iOS)' in line and i < 70:
-                if i+1 < len(lines) and '// #697:' in lines[i+1]:
-                    skip_next_endif = True
+        python3 << 'PYEOF'
+        import re, os
+
+        def fix_timer(path):
+            if not os.path.exists(path):
+                return
+            lines = open(path).readlines()
+            out, i = [], 0
+            while i < len(lines):
+                if '.sensoryFeedback(trigger:' in lines[i]:
+                    depth = 0
+                    while i < len(lines):
+                        depth += lines[i].count('{') - lines[i].count('}')
+                        i += 1
+                        if depth == 0:
+                            break
                     continue
-            if skip_next_endif:
-                if line.strip() == '#endif':
-                    skip_next_endif = False
-                continue
-            new_lines.append(line)
-        content = ''.join(new_lines)
-        content = re.sub(r'\.onChange\(of: ([^)]+)\) \{ _, ([a-zA-Z_][a-zA-Z0-9_]*) in', r'.onChange(of: \1) { \2 in', content)
-        content = re.sub(r'\.onChange\(of: ([^)]+)\) \{ _, _ in', r'.onChange(of: \1) { _ in', content)
-        with open('Strand/Screens/ScreenScaffold.swift', 'w') as f:
-            f.write(content)
-        print("✓ ScreenScaffold.swift patched")
-        PYTHON
-        
-        # 5. Fix all onChange with two parameters
-        find Strand StrandiOS StrandiOSShared -name "*.swift" -type f -exec sed -i '' 's/\.onChange(of: \([^)]*\)) { _, \([^ ]*\) in/.onChange(of: \1) { \2 in/g' {} +
-        find Strand StrandiOS StrandiOSShared -name "*.swift" -type f -exec sed -i '' 's/\.onChange(of: \([^)]*\)) { _, _ in/.onChange(of: \1) { _ in/g' {} +
-        
-        echo "✅ All patches applied"
-    
+                out.append(lines[i])
+                i += 1
+            open(path, 'w').writelines(out)
+            print('patched', path)
+
+        def fix_scaffold(path):
+            if not os.path.exists(path):
+                return
+            lines = open(path).readlines()
+            targets = [i for i, l in enumerate(lines) if '.scrollBounceBehavior(' in l and not l.strip().startswith('//')]
+            for idx in reversed(targets):
+                start = idx
+                while start > 0 and '#if os(iOS)' not in lines[start]:
+                    start -= 1
+                end = idx
+                while end < len(lines) and '#endif' not in lines[end]:
+                    end += 1
+                del lines[start:end + 1]
+            open(path, 'w').writelines(lines)
+            print('patched', path)
+
+        def fix_onchange(path):
+            c = open(path).read()
+            c2 = re.sub(r'\.onChange\(of: ([^)]*)\) \{ _, ([A-Za-z_][A-Za-z0-9_]*) in', r'.onChange(of: \1) { \2 in', c)
+            c2 = re.sub(r'\.onChange\(of: ([^)]*)\) \{ _, _ in', r'.onChange(of: \1) { _ in', c2)
+            if c2 != c:
+                open(path, 'w').write(c2)
+                print('patched', path)
+
+        fix_timer('Strand/Screens/IntervalTimerView.swift')
+        fix_scaffold('Strand/Screens/ScreenScaffold.swift')
+        for d in ['Strand', 'StrandiOS', 'StrandiOSShared']:
+            for root, _, files in os.walk(d):
+                for f in files:
+                    if f.endswith('.swift'):
+                        fix_onchange(os.path.join(root, f))
+        print('All patches applied')
+        PYEOF
+
     - name: Generate Xcode project
-      run: |
-        xcodegen generate
-    
-    - name: Build for iOS 16.3
+      run: xcodegen generate
+
+    - name: Build archive
       run: |
         xcodebuild archive \
           -project Strand.xcodeproj \
@@ -94,38 +96,23 @@ jobs:
           CODE_SIGN_IDENTITY="-" \
           CODE_SIGNING_REQUIRED=NO \
           CODE_SIGNING_ALLOWED=NO
-    
+
     - name: Create IPA
       run: |
         mkdir -p Payload
         cp -R ./NOOPiOS.xcarchive/Products/Applications/NOOP\ Staging.app ./Payload/
         zip -r NOOP_iOS16_TrollStore.ipa Payload
-        echo "📦 IPA created successfully"
-    
-    - name: Upload IPA artifact
+
+    - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: NOOP-iOS16-TrollStore
         path: NOOP_iOS16_TrollStore.ipa
-        retention-days: 30
-    
+        retention-days: 90
+
     - name: Create Release
       if: startsWith(github.ref, 'refs/tags/')
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       with:
         files: NOOP_iOS16_TrollStore.ipa
         name: "NOOP iOS 16.3 - ${{ github.ref_name }}"
-        body: |
-          ## NOOP for iOS 16.3.1 (TrollStore)
-          
-          ### Installation
-          1. Download the IPA file below
-          2. Transfer to your iPhone
-          3. Open with TrollStore
-          
-          ### Changes
-          - Downgraded to iOS 16.3 deployment target
-          - Removed iOS 17+ only APIs
-          - Compatible with TrollStore
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
