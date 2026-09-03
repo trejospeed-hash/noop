@@ -174,10 +174,15 @@ struct SettingsView: View {
     // distances/weights/heights/temperatures are SHOWN — and lets the profile fields below take
     // imperial entry. Temperature has a separate override so °C/°F can be picked independently.
     /// #1821: Clock format. Defaults to `.system`, so upgrading changes nobody's displayed times.
+    /// #1841: shared with Android by name and meaning; each platform keeps its own store. Default FALSE
+    /// on Apple (Android defaults true) because the system behaviour may not fire on our
+    /// `NavigationStack(path:)` tabs — see RootTabView.
+    @AppStorage("noop.bottomBarAutoHide") private var bottomBarAutoHide = false
     @AppStorage(ClockFormatPreference.defaultsKey)
     private var clockFormatRaw = ClockFormatPreference.system.rawValue
     @AppStorage(UnitPrefs.systemKey) private var unitSystemRaw = UnitSystem.metric.rawValue
     @AppStorage(UnitPrefs.temperatureKey) private var temperatureRaw = ""
+    @AppStorage(UnitPrefs.skinTempDisplayKey) private var skinTempDisplayRaw = ""   // #1846
     // Effort display scale (#268). Display-only — Effort stays stored 0–100, this only chooses whether
     // it's shown on NOOP's 0–100 axis or WHOOP's 0–21 Day Strain axis.
     @AppStorage(UnitPrefs.effortScaleKey) private var effortScaleRaw = EffortScale.hundred.rawValue
@@ -991,6 +996,20 @@ struct SettingsView: View {
                     .accessibilityLabel("Temperature unit")
                 }
                 rowDivider
+                FormRow(label: "Skin temperature") {
+                    // #1846: lead with a temperature ("33.5 °C") or with the move from your own baseline
+                    // ("-0.1 Δ°C"). Only a PREFERENCE — a night that measured just one of the two still
+                    // shows that one, so the choice can never blank a card.
+                    Picker("Skin temperature", selection: $skinTempDisplayRaw) {
+                        Text("Temperature").tag("")
+                        Text("vs baseline").tag(SkinTempDisplay.Kind.deviation.rawValue)
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .tint(StrandPalette.accent)
+                    .accessibilityLabel("Skin temperature display")
+                }
+                rowDivider
                 // Effort scale (#268) — show NOOP's native 0–100 Effort or WHOOP's 0–21 Day Strain axis.
                 // Display-only; the stored value never changes, so a flip just re-labels every Effort read-out.
                 FormRow(label: "Effort scale") {
@@ -1144,6 +1163,22 @@ struct SettingsView: View {
                     // picker would appear to do nothing until the app restarted.
                     .onChangeCompat(of: clockFormatRaw) { _ in AppClock.invalidate() }
                 }
+                #if os(iOS)
+                rowDivider
+                // #1841: the same preference Android drives its own bar with, by name and meaning. Here
+                // the SYSTEM owns the behaviour — iOS 26 minimises the tab bar to a pill on scroll rather
+                // than sliding it away — so this asks for the platform's reading of the intent rather
+                // than reproducing ours. Below iOS 26 the modifier is inert and the row simply does
+                // nothing, which is why it is not offered there.
+                if #available(iOS 26.0, *) {
+                    FormRow(label: "Hide bar when scrolling") {
+                        Toggle("", isOn: $bottomBarAutoHide)
+                            .labelsHidden()
+                            .tint(StrandPalette.accent)
+                            .accessibilityLabel("Hide bar when scrolling")
+                    }
+                }
+                #endif
                 rowDivider
                 // Theme presets — one-tap bundles coordinating accent + chart world + backdrop + card
                 // opacity. Derived (no stored value): tweaking any control below flips this to Custom.

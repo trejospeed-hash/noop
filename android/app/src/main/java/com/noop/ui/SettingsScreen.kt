@@ -671,6 +671,9 @@ fun SettingsScreen(
     var temperatureRaw by remember {
         mutableStateOf(NoopPrefs.of(context).getString(NoopPrefs.KEY_TEMPERATURE_UNIT, "") ?: "")
     }
+    // #1846: which skin-temp number the cards lead with. Display-only, like the row above — the stored
+    // value never changes, so flipping it just re-reads the same night on the other scale.
+    var skinTempKind by remember { mutableStateOf(UnitPrefs.skinTempPreferred(context)) }
     // Effort display scale (#268) — show NOOP's native 0–100 Effort or WHOOP's 0–21 Day Strain axis.
     // Display-only; the stored value never changes. Mirrors into local state like the toggles above.
     var effortScale by remember { mutableStateOf(UnitPrefs.effortScale(context)) }
@@ -1218,6 +1221,30 @@ fun SettingsScreen(
                     )
                 }
                 SettingsRowDivider()
+                SettingsFormRow(label = uiString(R.string.l10n_settings_screen_skin_temperature_fc103030)) {
+                    // #1846: lead with a temperature ("33.5 °C") or with the move from your own baseline
+                    // ("-0.1 Δ°C"). Only a PREFERENCE — a night that measured just one of the two still
+                    // shows that one, so the choice can never blank a card.
+                    SegmentedPillControl(
+                        items = listOf(
+                            com.noop.analytics.SkinTempDisplay.Kind.ABSOLUTE,
+                            com.noop.analytics.SkinTempDisplay.Kind.DEVIATION,
+                        ),
+                        selection = skinTempKind,
+                        label = {
+                            if (it == com.noop.analytics.SkinTempDisplay.Kind.ABSOLUTE) {
+                                uiString(R.string.l10n_settings_screen_temperature_0a9062a9)
+                            } else {
+                                uiString(R.string.skin_temp_vs_baseline)
+                            }
+                        },
+                        onSelect = {
+                            skinTempKind = it
+                            NoopPrefs.setSkinTempDisplay(context, it)
+                        },
+                    )
+                }
+                SettingsRowDivider()
                 // Effort scale (#268) — NOOP's native 0–100 Effort or WHOOP's 0–21 Day Strain axis.
                 // Display-only; the stored value never changes, so a flip just re-labels every read-out.
                 SettingsFormRow(label = uiString(R.string.l10n_settings_screen_effort_scale_81afa9ef)) {
@@ -1305,6 +1332,32 @@ fun SettingsScreen(
                             context.hostingActivity()?.recreate()
                         }
                     },
+                )
+            }
+            SettingsRowDivider()
+            // #1836: which bottom-bar layout to draw. Default OFF — the shipped reserved slot. The
+            // overlay lets a screen's own backdrop show through the bar's glass, which is what it was
+            // built for, but it is app-shell layout no test can judge, so it ships switchable.
+            SettingsFormRow(label = uiString(R.string.l10n_settings_screen_bottom_bar_overlay_f257c96f)) {
+                Switch(
+                    checked = BottomBarStyleStore.overlay,
+                    onCheckedChange = { BottomBarStyleStore.set(context, it) },
+                )
+            }
+            SettingsRowDivider()
+            // #1839: hide the bar while scrolling down, bring it back on scrolling up. Only does anything
+            // with the overlay on, because in the slot layout the space is reserved and hiding the bar
+            // would leave an empty band — so the row is disabled rather than silently inert.
+            // Reduce Motion pins the bar visible (a bar that vanishes without animation reads as a
+            // glitch), so with it on the toggle would flip and change nothing. A switch that silently
+            // does nothing is worse than one that is plainly unavailable, so it greys out for the same
+            // reason it does without the overlay.
+            val autoHideAvailable = BottomBarStyleStore.overlay && !rememberReduceMotion()
+            SettingsFormRow(label = uiString(R.string.l10n_settings_screen_hide_bar_when_scrolling_b077d9f3)) {
+                Switch(
+                    checked = BottomBarStyleStore.autoHide,
+                    enabled = autoHideAvailable,
+                    onCheckedChange = { BottomBarStyleStore.setAutoHide(context, it) },
                 )
             }
             SettingsRowDivider()

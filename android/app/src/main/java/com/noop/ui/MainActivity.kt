@@ -146,6 +146,7 @@ class MainActivity : ComponentActivity() {
         // Decode the optional custom background image (if set) + its toggles before first composition so
         // the backdrop is right from the first frame on every tab. No-op when no image is set.
         BackgroundImageStore.load(this)
+        BottomBarStyleStore.load(this)   // #1836: bottom-bar layout choice, default the shipped slot
 
         setContent {
             NoopTheme {
@@ -700,6 +701,14 @@ object NoopPrefs {
         of(context).edit().putBoolean(KEY_APP_ICON_NAVY, navy).apply()
     }
 
+    /** #1839: hide the overlay bottom bar while scrolling down, restore it on scrolling up. Default
+     *  ON (#1841). Only meaningful with the overlay layout, where the bar sits over content. */
+    const val KEY_BOTTOM_BAR_AUTO_HIDE = "noop.bottomBarAutoHide"
+
+    /** #1836: draw the bottom bar as an overlay (glass over the screen's backdrop) instead of a reserved
+     *  Scaffold slot. Default ON (#1841), after the overlay was confirmed on a device. */
+    const val KEY_OVERLAY_BOTTOM_BAR = "noop.overlayBottomBar"
+
     /** #1821: Clock format ("system" / "twelveHour" / "twentyFourHour"). Shares its stored vocabulary
      *  with the Apple @AppStorage binding via [com.noop.analytics.ClockFormatPreference]. */
     const val KEY_CLOCK_FORMAT = com.noop.analytics.ClockFormatPreference.PREFS_KEY
@@ -710,11 +719,25 @@ object NoopPrefs {
     const val KEY_UNIT_SYSTEM = "units.system"
     const val KEY_TEMPERATURE_UNIT = "units.temperature"
 
+    /** #1846: which skin-temp number the cards lead with — "" / absent = a temperature (default), or the
+     *  DEVIATION raw to lead with the ±baseline move. Display-only; nothing stored ever changes. */
+    const val KEY_SKIN_TEMP_DISPLAY = "units.skinTempDisplay"
+
     fun setUnitSystem(context: Context, system: UnitSystem) {
         of(context).edit().putString(KEY_UNIT_SYSTEM, system.raw).apply()
     }
 
     /** Persist the temperature override, or pass null to clear it back to "match the system". */
+    fun setSkinTempDisplay(context: Context, kind: com.noop.analytics.SkinTempDisplay.Kind?) {
+        of(context).edit().apply {
+            if (kind == null || kind == com.noop.analytics.SkinTempDisplay.Kind.ABSOLUTE) {
+                remove(KEY_SKIN_TEMP_DISPLAY)
+            } else {
+                putString(KEY_SKIN_TEMP_DISPLAY, kind.raw)
+            }
+        }.apply()
+    }
+
     fun setTemperatureUnit(context: Context, unit: TemperatureUnit?) {
         of(context).edit().apply {
             if (unit == null) remove(KEY_TEMPERATURE_UNIT) else putString(KEY_TEMPERATURE_UNIT, unit.raw)
