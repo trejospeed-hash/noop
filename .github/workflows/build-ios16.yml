@@ -59,21 +59,40 @@ jobs:
                 open(path, 'w').write(c2)
                 print('patched onChange in', path)
 
-        def fix_scroll_bounce(path):
-            """Remove entire #if os(iOS) block containing scrollBounceBehavior"""
+        def fix_scroll_bounce_blocks(path):
+            """Remove entire #if os(iOS) blocks containing scrollBounceBehavior"""
             if not os.path.exists(path):
                 return
-            with open(path, 'r') as f:
-                content = f.read()
+            lines = open(path).readlines()
+            out = []
+            i = 0
+            while i < len(lines):
+                # Check if this is an #if os(iOS) block
+                if lines[i].strip() == '#if os(iOS)':
+                    # Look ahead to see if this block contains scrollBounceBehavior
+                    block_start = i
+                    j = i + 1
+                    found_scroll_bounce = False
+                    while j < len(lines):
+                        if lines[j].strip() == '#endif':
+                            # Check if we found scrollBounceBehavior in this block
+                            block_content = ''.join(lines[block_start:j+1])
+                            if '.scrollBounceBehavior(' in block_content:
+                                found_scroll_bounce = True
+                            break
+                        j += 1
+                    
+                    if found_scroll_bounce:
+                        # Skip the entire block (don't add to output)
+                        i = j + 1
+                        print(f'removed scrollBounceBehavior block in {path}')
+                        continue
+                
+                out.append(lines[i])
+                i += 1
             
-            # Remove the entire #if os(iOS) ... #endif block containing scrollBounceBehavior
-            pattern = r'\s*#if os\(iOS\)\s*\n\s*\.scrollBounceBehavior\([^)]*\)\s*\n\s*#endif'
-            new_content = re.sub(pattern, '', content)
-            
-            if new_content != content:
-                with open(path, 'w') as f:
-                    f.write(new_content)
-                print('patched scrollBounceBehavior block in', path)
+            if len(out) != len(lines):
+                open(path, 'w').writelines(out)
 
         # Apply all patches to all Swift files
         for d in ['Strand', 'StrandiOS', 'StrandiOSShared', 'StrandiOSWidgets']:
@@ -85,7 +104,7 @@ jobs:
                         path = os.path.join(root, f)
                         fix_timer(path)
                         fix_onchange(path)
-                        fix_scroll_bounce(path)
+                        fix_scroll_bounce_blocks(path)
 
         print('All patches applied')
         PYEOF
