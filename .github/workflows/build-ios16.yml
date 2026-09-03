@@ -27,33 +27,74 @@ jobs:
         VERSION="$(awk -F'"' '/MARKETING_VERSION:/ { print $2; exit }' project.yml)"
         SHORT_SHA="$(git rev-parse --short HEAD)"
         DOWNLOAD_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/latest-ios16/NOOP_iOS16_TrollStore.ipa"
-        PREVIOUS_SHA="$(git rev-list -n 1 latest-ios16 2>/dev/null || true)"
 
-        if [ -n "$PREVIOUS_SHA" ] && git merge-base --is-ancestor "$PREVIOUS_SHA" HEAD; then
-          CHANGELOG="$(git log --oneline --no-merges "${PREVIOUS_SHA}..HEAD" | head -20 || true)"
-        else
-          CHANGELOG="$(git log --oneline --no-merges -20 || true)"
-        fi
+        VERSION="$VERSION" python3 << 'PYEOF'
+        import os
+        import re
+        from pathlib import Path
 
-        if [ -z "$CHANGELOG" ]; then
-          CHANGELOG="No new non-merge commits detected."
-        fi
+        version = os.environ['VERSION']
+        changelog = Path('CHANGELOG.md').read_text()
+        matches = list(re.finditer(r'^##\s+(\d+\.\d+\.\d+)([^\n]*)\n', changelog, re.MULTILINE))
+
+        chosen = None
+        for index, match in enumerate(matches):
+            if match.group(1) == version:
+                chosen = (index, match)
+                break
+        if chosen is None and matches:
+            chosen = (0, matches[0])
+
+        if chosen is None:
+            notes = 'No release notes were found in CHANGELOG.md.'
+            source_version = version
+        else:
+            index, match = chosen
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(changelog)
+            source_version = match.group(1)
+            notes = changelog[match.start():end].strip()
+
+        Path('app_release_notes.md').write_text(notes + '\n')
+        Path('release_notes_source.txt').write_text(source_version + '\n')
+        PYEOF
+
+        NOTES_VERSION="$(cat release_notes_source.txt)"
+
+        {
+          echo "NOOP iOS 16.3.1 para TrollStore"
+          echo
+          echo "- Version compilada: ${VERSION}"
+          echo "- Commit: ${GITHUB_SHA}"
+          echo "- IPA: ${DOWNLOAD_URL}"
+          echo
+          if [ "$NOTES_VERSION" != "$VERSION" ]; then
+            echo "> Notas tomadas de NOOP ${NOTES_VERSION}, la seccion mas reciente de CHANGELOG.md."
+            echo
+          fi
+          cat app_release_notes.md
+        } > release_body.md
+
+        {
+          echo "NOOP iOS 16.3.1 actualizado"
+          echo
+          echo "Version compilada: ${VERSION}"
+          echo "Commit: ${GITHUB_SHA}"
+          echo "IPA: ${DOWNLOAD_URL}"
+          echo
+          if [ "$NOTES_VERSION" != "$VERSION" ]; then
+            echo "Novedades de NOOP ${NOTES_VERSION} (seccion mas reciente de CHANGELOG.md):"
+          else
+            echo "Novedades de NOOP ${VERSION}:"
+          fi
+          echo
+          cat app_release_notes.md
+        } > mail_body.txt
 
         {
           echo "version=${VERSION}"
           echo "short_sha=${SHORT_SHA}"
           echo "download_url=${DOWNLOAD_URL}"
           echo "subject=NOOP iOS 16.3.1 actualizado - ${VERSION}/${SHORT_SHA}"
-          echo "body<<MAIL_BODY_EOF"
-          echo "NOOP iOS 16.3.1 actualizado"
-          echo
-          echo "Version: ${VERSION}"
-          echo "Commit: ${GITHUB_SHA}"
-          echo "IPA: ${DOWNLOAD_URL}"
-          echo
-          echo "Cambios recientes:"
-          echo "${CHANGELOG}"
-          echo "MAIL_BODY_EOF"
         } >> "$GITHUB_OUTPUT"
 
     - name: Select latest Xcode
@@ -195,6 +236,7 @@ jobs:
       with:
         tag_name: latest-ios16
         name: "NOOP iOS 16.3 (auto-actualizada)"
+        body_path: release_body.md
         files: NOOP_iOS16_TrollStore.ipa
         prerelease: false
         draft: false
@@ -211,4 +253,4 @@ jobs:
         subject: ${{ steps.release_meta.outputs.subject }}
         to: trejospeed@gmail.com
         from: ${{ secrets.MAIL_FROM }}
-        body: ${{ steps.release_meta.outputs.body }}
+        body: file://mail_body.txt
