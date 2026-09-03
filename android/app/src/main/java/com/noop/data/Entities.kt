@@ -3,6 +3,7 @@ package com.noop.data
 import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.Index
+import androidx.room.PrimaryKey
 
 /*
  * Room entities mirroring the verified GRDB schema in
@@ -321,6 +322,13 @@ data class DailyMetric(
     // Five-minute SDNN index (ms), separate from avgHrv (RMSSD). Strap rows compute it from in-bed R-R;
     // Apple Health rows mirror the source SDNN. Health Connect RMSSD does not populate this column.
     val avgSdnn: Double? = null,
+    // Nightly ABSOLUTE skin temperature (°C): the wear-gated mean over the night's detected sleep, the
+    // value skinTempDevC is derived FROM (#1636). Appended LAST so the column order matches the Room
+    // CREATE TABLE and the Swift row. Distinct from skinTempDevC, which is bimodal — CSV/Health imports
+    // write an absolute wrist °C into that column and SkinTempDisplay separates them by magnitude. This
+    // one is unambiguous: always absolute, and only the strap pipeline writes it. Nullable: nights scored
+    // before v34 stay null until a re-score re-derives them from the same raw samples.
+    val skinTempC: Double? = null,
 )
 
 /**
@@ -417,8 +425,8 @@ data class MetricSeriesRow(
 )
 
 /**
- * Provider provenance for one NOOP-computed score. Separate from `dayOwnership`: ownership controls
- * raw-input resolution, while this records the source actually used for a persisted metric.
+ * Provenance for one NOOP-computed score. [sourceId] normally records the provider actually used, while
+ * `vo2max_est` records its estimator id. Separate from `dayOwnership`, which controls input resolution.
  */
 @Entity(
     tableName = "scoreInputProvenance",
@@ -431,6 +439,22 @@ data class ScoreInputProvenanceRow(
     @ColumnInfo(name = "key") val key: String,
     val sourceId: String,
 )
+
+/** Estimator identity persisted beside a `vo2max_est` point in [ScoreInputProvenanceRow.sourceId].
+ *  Existing points have no such row and therefore remain explicitly unknown; never infer their method
+ *  from the user's current profile because a waist measurement may have changed since they were scored. */
+enum class Vo2MaxEstimator(val provenanceId: String) {
+    NES("nes"),
+    UTH("uth");
+
+    companion object {
+        fun fromProvenanceId(value: String?): Vo2MaxEstimator? = entries.firstOrNull {
+            it.provenanceId == value
+        }
+
+        fun forWaistCm(waistCm: Double): Vo2MaxEstimator = if (waistCm > 0.0) NES else UTH
+    }
+}
 
 /**
  * Lab Book marker reading (Health Records pillar). Swift `labMarker` (Database.swift v17 /
@@ -612,62 +636,29 @@ data class AppleStepHour(
  * keeping a v26-heavy night to roughly the same order of magnitude as ONE extra per-second stream. The
  * BLOB format is byte-identical to the Swift GRDB `WhoopStore.packPpgSamples` so a `.noopbak` round-trips.
  * PK (deviceId, ts) mirrors every other per-second stream; a truncated frame can decode fewer than 24
- * samples. Fields are declared in the SAME order as the GRDB schema (deviceId, ts, samples) so the
- * migration's CREATE TABLE column order matches Room's generated shape.
+ * samples. Fields are declared in the SAME order as the GRDB schema
+ * (deviceId, ts, samples, burstIndex) so Room's generated shape stays byte-identical.
  */
 @Entity(tableName = "ppgWaveformSample", primaryKeys = ["deviceId", "ts"])
 data class PpgWaveformSampleEntity(
     val deviceId: String,
     val ts: Long,
     val samples: ByteArray,
+    val burstIndex: Int? = null,
 ) {
     // ByteArray needs structural equals/hashCode (the generated identity ones break round-trip asserts).
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is PpgWaveformSampleEntity) return false
-        return deviceId == other.deviceId && ts == other.ts && samples.contentEquals(other.samples)
+        return deviceId == other.deviceId && ts == other.ts && samples.contentEquals(other.samples) &&
+            burstIndex == other.burstIndex
     }
 
     override fun hashCode(): Int {
         var result = deviceId.hashCode()
         result = 31 * result + ts.hashCode()
         result = 31 * result + samples.contentHashCode()
-        return result
-    }
-}
-
-/**
- * One 1-second WHOOP 5/MG raw-IMU offload buffer (#423): 100 Hz 6-axis inertial data. [samples] is a
- * packed little-endian i16 BLOB of the six columns in wire order — ax×100, ay×100, az×100, gx×100, gy×100,
- * gz×100 (1200 bytes) — decoded by [com.noop.protocol.Whoop5RawImu] (scales 1/4096 g/LSB, 2000/32768 dps/
- * LSB). The strap already delivers this in the connect-time offload burst; capturing it needs NO arming.
- * Instrument-first + bounded: written only when raw capture is enabled, and pruned to a rolling recent
- * window ([WhoopRepository.RAW_IMU_RETENTION_ROWS]). Twin of the GRDB `rawImuSample` table. Natural key
- * (deviceId, ts) = one row per strap-second.
- *
- * CONSUMER STATUS (#978): deliberately none yet — instrument-first, the same stance as `v18AuxSample`. The
- * writer runs only with raw capture enabled + a 5/MG deep-data unlock; nothing scores, gates or shows a row.
- * The [WhoopRepository.rawImuSamples] / [WhoopDao.rawImuSamples] reader is intentionally dormant (zero
- * callers) — the eventual cross-check seam, NOT dead code, so do not delete it. The GRDB twin has no reader
- * yet by the same rule: one lands WITH a validated consumer, not before.
- */
-@Entity(tableName = "rawImuSample", primaryKeys = ["deviceId", "ts"])
-data class RawImuSampleEntity(
-    val deviceId: String,
-    val ts: Long,
-    val samples: ByteArray,
-) {
-    // ByteArray needs structural equals/hashCode (the generated identity ones break round-trip asserts).
-    override fun equals(other: Any?): Boolean {
-        if (this === other) return true
-        if (other !is RawImuSampleEntity) return false
-        return deviceId == other.deviceId && ts == other.ts && samples.contentEquals(other.samples)
-    }
-
-    override fun hashCode(): Int {
-        var result = deviceId.hashCode()
-        result = 31 * result + ts.hashCode()
-        result = 31 * result + samples.contentHashCode()
+        result = 31 * result + (burstIndex ?: 0)
         return result
     }
 }

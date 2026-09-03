@@ -53,6 +53,12 @@ struct LiquidTodayView: View {
     @State private var fitnessAge: Double?         // exploreSeries("fitness_age").last
     @State private var vo2max: Double?             // exploreSeries("vo2max_est").last (#1391)
     @State private var vitality: Double?           // exploreSeries("vitality").last
+    // Queue 11a: day-keyed "spo2_candidate" metricSeries (WHOOP `spo2_candidate_82` or Oura
+    // ceiling@100 `0x6F`, device-conditional — see `IntelligenceEngine`). Empty when the
+    // experimental toggle is OFF (the engine writes nothing) or the owner has no in-band reading.
+    // Read unconditionally like the classic TodayView's `spo2CandidateSpark` — always empty when
+    // the toggle is off, so no separate gate is needed at fetch time.
+    @State private var spo2CandidateByDay: [String: Double] = [:]
     @State private var stepsEst: Double?           // steps_est, day-keyed to the selected day (fallback)
     @State private var importedStepsDay: Int?      // Apple Health steps for the selected day (middle tier)
     @State private var importedActiveKcalDay: Double?  // #616: Apple Health active energy for the day (calorie fallback)
@@ -337,6 +343,16 @@ struct LiquidTodayView: View {
             #endif
         }
         .coordinateSpace(name: Self.pullSpace)
+        #if os(iOS)
+        // #697 parity: ScreenScaffold already stops a vertical scroll from drifting/bouncing the
+        // screen left-right on every other tab. Liquid Today runs its own ScrollView (not
+        // ScreenScaffold) and never got the fix, so it was the one screen left with the spurious
+        // horizontal rubber-band/swipe. `.basedOnSize` only permits horizontal bounce when content
+        // genuinely overflows the width (it does not here, the column is width-capped), so this
+        // brings Today's scroll behaviour in line with the rest of the app without touching the
+        // vertical pull-to-refresh gesture above.
+        .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+        #endif
         .onPreferenceChange(PullOffsetKey.self) { handlePull($0) }
         // The sky is a FIXED full-bleed backdrop drawn behind the scroll content, edge-to-edge under the
         // status bar. A ScrollView background does not scroll with the content, so pulling down never
@@ -437,7 +453,16 @@ struct LiquidTodayView: View {
     private func handlePull(_ y: CGFloat) {
         pullY = max(0, y)
         guard !refreshing else { return }
-        if pullY >= pullThreshold, !refreshArmed {
+        // #1748 twin: gate the ARM, not the release. `syncNow()`'s own gate checks connected + bonded, and
+        // `bonded` is set by the live-HR path for a 5/MG that has never completed a handshake — so the pull
+        // was accepted and then declined in silence. `historyReady` is the client's OWN precondition, so
+        // this cannot withhold a sync that would have run.
+        //
+        // On the ARM specifically: gating the RELEASE below would leave `refreshArmed` stuck true for the
+        // rest of the gesture, since that branch is the only thing that clears it — a worse failure than
+        // the silent one being fixed. Not arming also withholds the haptic, which is the honest signal
+        // that the gesture is unavailable rather than unresponsive.
+        if pullY >= pullThreshold, !refreshArmed, ble.state.historyReady {
             refreshArmed = true
             pullHaptic &+= 1
         }
@@ -865,12 +890,51 @@ struct LiquidTodayView: View {
             cardLink(.metricSourced(key: stepsDetailKey, source: stepsDetailSource), title: card.title, sub: card.subtitle,
                      value: stepsText, tint: StrandPalette.metricCyan, frac: fracOver(stepCount, 10000))
         case .bloodOxygen:
-            // Not wired to a real read yet — render EMPTY (not half-full) so it doesn't imply a reading.
-            cardLink(.metric("spo2"), title: card.title, sub: card.subtitle,
-                     value: "–", tint: StrandPalette.metricCyan, frac: nil)
+            // #1627: these two were the last cards still on the "not wired yet" placeholder, so on iOS 26 —
+            // where Liquid Today is the DEFAULT Today screen — Blood Oxygen and Skin Temp read "–" for
+            // everyone while every other card on the same screen showed a real number off the same
+            // `displayDay`. Reported with a clean A/B: turning Liquid Today off restored both immediately.
+            //
+            // The VALUE resolution is copied from the Key Metrics tile below rather than reinvented —
+            // candidate fallback and experimental gating included — so the card and the tile cannot
+            // disagree about the same day's number. The tile's key/route handling is deliberately NOT
+            // copied; see below for why the two are not interchangeable.
+            let spo2Real = displayDay?.spo2Pct ?? vitalsDay?.spo2Pct
+            let spo2CandidateOn = PuffinExperiment.spo2CandidateDisplayEnabled
+            let spo2Candidate = spo2Real == nil && spo2CandidateOn
+                ? spo2CandidateByDay[cachedDisplayDay?.day ?? selectedDayKey]
+                : nil
+            let spo2 = spo2Real ?? spo2Candidate
+            // ALWAYS routes to "spo2", never "spo2_candidate". The Key Metrics tile switches that string,
+            // but there it is a SPARKLINE SERIES key (ktile feeds it to windowedSpark; navigation goes
+            // through its separate detailMetric argument). Here the string is a NAVIGATION route resolved
+            // against MetricCatalog — which has no "spo2_candidate" entry — so switching it would drop the
+            // tap into the Health catch-all instead of the Blood Oxygen detail. Same literal, two different
+            // key spaces.
+            // The candidate MUST carry its label. Every other surface that shows it says "strap estimate
+            // (unverified)" — the Key Metrics tile below, VitalSignsSummary, the classic TodayView — and
+            // PuffinExperiment's own doc says the toggle surfaces it "in the Blood Oxygen tile/card,
+            // labelled". An unlabelled number here would read as a measured SpO2 on the one surface that
+            // is the DEFAULT Today screen on iOS 26. The subtitle is the slot this card has.
+            cardLink(.metric("spo2"),
+                     title: card.title,
+                     sub: spo2Candidate != nil ? String(localized: "strap estimate (unverified)") : card.subtitle,
+                     // Em dash, not the en dash the stub used: the classic Blood Oxygen card and
+                     // skinTempCardValue both return "—", so the stub's "–" would have left the two
+                     // adjacent cards printing different glyphs for the same "no reading" state.
+                     value: spo2.map { String(format: "%.0f%%", locale: AppLanguage.activeLocale, $0) } ?? "—",
+                     tint: StrandPalette.metricCyan, frac: fracOver(spo2, 100))
         case .skinTemp:
+            // Skin temp has NO Key Metrics tile to mirror (KeyMetric has no skinTemp case), so this uses
+            // the classic card's extracted resolver instead — the same one TodayView calls, which is why
+            // it is a static: the formatting decision is testable without a live view.
+            //
+            // frac stays nil deliberately. A signed deviation has no natural 0–100 fill, and a ring drawn
+            // from one would imply a magnitude the number does not carry.
+            let skin = displayDay?.skinTempDevC ?? vitalsDay?.skinTempDevC
             cardLink(.metric("skin_temp"), title: card.title, sub: card.subtitle,
-                     value: "–", tint: StrandPalette.metricAmber, frac: nil)
+                     value: TodayView.skinTempCardValue(skin, fahrenheit: temperatureUnit == .fahrenheit),
+                     tint: StrandPalette.metricAmber, frac: nil)
         case .calories:
             // #616: show the resolved imported-first value and route to the matching detail source, like
             // the Steps card — was a "–" placeholder wired to the imported-only detail.
@@ -1136,8 +1200,20 @@ struct LiquidTodayView: View {
         case .restingHr:
             ktile(String(localized: "Rest HR"), icon: keyMetricIcon(metric), intText(rhr), "bpm", StrandPalette.metricRose, fracOver(rhr, 100), key: "rhr")
         case .bloodOxygen:
-            let spo2 = displayDay?.spo2Pct ?? vitalsDay?.spo2Pct
-            ktile(String(localized: "Blood Oxygen"), icon: keyMetricIcon(metric), intText(spo2), "%", StrandPalette.metricCyan, fracOver(spo2, 100), key: "spo2")
+            // Queue 11a: the Liquid tile used to read `spo2Pct` only, with no candidate fallback at all
+            // (unlike the classic `TodayView`/`VitalSignsSummary`), so an Oura-only or BLE-only WHOOP
+            // 5/MG install with the experimental toggle ON still saw a bare "—" here. Falls back to the
+            // device-conditional "spo2_candidate" mean (WHOOP: `spo2_candidate_82`; Oura: ceiling@100
+            // `0x6F`, see `AnalyticsEngine.nightlySpo2CeilingMean`) only when `spo2Pct` is nil AND the
+            // toggle is ON — same gating as the classic tile, never as the default.
+            let spo2Real = displayDay?.spo2Pct ?? vitalsDay?.spo2Pct
+            let spo2CandidateOn = PuffinExperiment.spo2CandidateDisplayEnabled
+            let spo2CandidateValue = spo2Real == nil && spo2CandidateOn
+                ? spo2CandidateByDay[cachedDisplayDay?.day ?? selectedDayKey]
+                : nil
+            let spo2 = spo2Real ?? spo2CandidateValue
+            ktile(String(localized: "Blood Oxygen"), icon: keyMetricIcon(metric), intText(spo2), "%", StrandPalette.metricCyan, fracOver(spo2, 100), key: spo2CandidateValue != nil ? "spo2_candidate" : "spo2",
+                  caption: spo2CandidateValue != nil ? String(localized: "strap estimate (unverified)") : nil)
         case .respiratory:
             let resp = displayDay?.respRateBpm ?? vitalsDay?.respRateBpm ?? respDay?.respRateBpm
             ktile(String(localized: "Respiratory"), icon: keyMetricIcon(metric), resp.map { String(format: "%.1f", locale: AppLanguage.activeLocale, $0) } ?? "—", "rpm", StrandPalette.accent, fracOver(resp, 24), key: "resp_rate")
@@ -1151,6 +1227,20 @@ struct LiquidTodayView: View {
             // detail source, so the number, its sparkline and the chart it opens all agree.
             ktile(String(localized: "Calories"), icon: keyMetricIcon(metric), intText(caloriesCount), "kcal", StrandPalette.metricAmber,
                   fracOver(caloriesCount, 800), key: "energy_kcal", detailMetric: caloriesDetailMetric)
+        case .skinTemp:
+            // Added 2026-08-24 (queue 11c follow-up): first Key Metrics appearance for Skin Temp — was
+            // already a "Your Cards" tile (`DashboardCard.skinTemp`), never a Key Metrics one. Same
+            // 2-level carry the Blood Oxygen case just above uses (displayDay → the cached vitals carry),
+            // and the SAME `SkinTempDisplay` formatter every other skin-temp surface uses so a deviation
+            // reads "+0.1 Δ°C" here exactly as it does on "Your Cards"/the Deep Timeline, never the plain
+            // `%+.1f°` that read a fabricated absolute value for a signed deviation (#622).
+            let skinValue = displayDay?.skinTempDevC ?? vitalsDay?.skinTempDevC
+            let skinText = skinValue.map {
+                SkinTempDisplay.format($0, fahrenheit: temperatureUnit == .fahrenheit)
+            } ?? "—"
+            // The card's own unit is deliberately empty — the value carries "°C"/"Δ°F" itself, same as
+            // the classic TodayView Skin Temp card.
+            ktile(String(localized: "Skin Temp"), icon: keyMetricIcon(metric), skinText, "", StrandPalette.metricAmber, nil, key: "skin_temp")
         }
     }
 
@@ -1166,11 +1256,12 @@ struct LiquidTodayView: View {
         case .steps: return "figure.walk"
         case .weight: return "scalemass.fill"
         case .calories: return "flame.fill"
+        case .skinTemp: return "thermometer.medium"
         }
     }
 
     private func ktile(_ label: String, icon: String, _ value: String, _ unit: String, _ tint: Color, _ frac: Double?,
-                       key: String? = nil, detailMetric: MetricDescriptor? = nil) -> some View {
+                       key: String? = nil, detailMetric: MetricDescriptor? = nil, caption: String? = nil) -> some View {
         let displayValue = unit.isEmpty ? value : (unit == "%" ? value + unit : value + " " + unit)
         let tile = VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 6) {
@@ -1190,6 +1281,16 @@ struct LiquidTodayView: View {
                 .foregroundStyle(StrandPalette.textPrimary)
                 .lineLimit(1)
                 .minimumScaleFactor(0.75)
+            // Optional sub-value caveat (queue 11a): only ever set for an unvalidated candidate fallback
+            // (e.g. the SpO₂ strap estimate), so every other `ktile` call site — no `caption` argument —
+            // renders byte-identical to before this parameter existed.
+            if let caption {
+                Text(caption)
+                    .font(StrandFont.footnote)
+                    .foregroundStyle(StrandPalette.textTertiary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+            }
             LiquidTube(frac: frac ?? 0, tint: tint, height: 9, animated: false,
                        showsHighlight: false, usesCleanFill: true)
             // #430 parity: DETAILED tiles grow the trend graph under the bar, tinted to the metric and
@@ -1368,6 +1469,8 @@ struct LiquidTodayView: View {
         async let vo2A = repo.exploreSeries(key: "vo2max_est", source: "my-whoop")
         async let vitA = repo.exploreSeries(key: "vitality", source: "my-whoop")
         async let stepsA = repo.exploreSeries(key: "steps_est", source: "my-whoop")
+        // Queue 11a: SpO₂ candidate fallback (see `spo2CandidateByDay`'s declaration).
+        async let spo2CandA = repo.exploreSeries(key: "spo2_candidate", source: "my-whoop")
         async let appleA = repo.appleDailyRows()
         async let hrA = repo.hrBuckets(from: from, to: to, bucketSeconds: 300)
         async let wkA = repo.workoutRows()
@@ -1413,6 +1516,10 @@ struct LiquidTodayView: View {
         // matching the imported-first VALUE. Union of imported days + strap-row days. Mirrors Android's
         // caloriesSpark (windowed caloriesByDay).
         let appleRowsForSpark = await appleA
+        // Queue 11a: SpO₂ candidate fallback — day-keyed for the tile's value lookup, windowed for its
+        // detailed-mode sparkline below (same shape as `restByDay`/`kSparks["spo2"]` above).
+        let spo2CandSeries = await spo2CandA
+        spo2CandidateByDay = Dictionary(spo2CandSeries.map { ($0.day, $0.value) }, uniquingKeysWith: { _, last in last })
         var winImportedKcal: [String: Double] = [:]
         for r in appleRowsForSpark where r.day >= sparkCutoff && r.day <= selectedDayKey {
             if let k = r.activeKcal { winImportedKcal[r.day] = max(winImportedKcal[r.day] ?? 0, k) }
@@ -1427,6 +1534,10 @@ struct LiquidTodayView: View {
             "hrv": sparkRows.compactMap { r in r.avgHrv.map { (r.day, $0) } },
             "rhr": sparkRows.compactMap { r in r.restingHr.map { (r.day, Double($0)) } },
             "spo2": sparkRows.compactMap { r in r.spo2Pct.map { (r.day, $0) } },
+            "spo2_candidate": spo2CandSeries.filter { $0.day >= sparkCutoff && $0.day <= selectedDayKey },
+            // Added 2026-08-24 (queue 11c follow-up) for the new Skin Temp Key Metrics tile — already
+            // loaded on `sparkRows` (`daysSnapshot`), same as every other DailyMetric-column tile above.
+            "skin_temp": sparkRows.compactMap { r in r.skinTempDevC.map { (r.day, $0) } },
             "resp_rate": sparkRows.compactMap { r in r.respRateBpm.map { (r.day, $0) } },
             "steps": sparkRows.compactMap { r in r.steps.map { (r.day, Double($0)) } },
             // #616: the Calories tile drew no trend line — this dict had no matching entry, so windowedSpark
@@ -1491,7 +1602,7 @@ struct LiquidTodayView: View {
         if HostedCardPrefs.decodeEnabled(hostedCardsRaw).contains(where: { $0.origin == sleepOrigin }) {
             let hostedSessions = await repo.allSleepSessions()
             let hostedHabitual = await repo.habitualMidsleepSec()
-            let hostedMotion = await repo.sessionMotions(starts: hostedSessions.map { $0.startTs })
+            let hostedMotion = await repo.sessionMotions(sessions: hostedSessions)
             hostedSleepModel = SleepModel.build(SleepModelInputs(
                 days: repo.days,
                 sleeps: repo.sleeps,
@@ -1633,6 +1744,18 @@ struct LiquidTodayView: View {
         let f = NumberFormatter()
         f.numberStyle = .decimal
         return f.string(from: NSNumber(value: Int(s))) ?? "\(Int(s))"
+    }
+
+    // °C / °F for the Skin Temp card, resolved exactly the way the other six screens that show a
+    // temperature resolve it (TodayView, FullDayChartView, MetricExplorerView x2, SettingsView,
+    // HealthView): the explicit override when set, else derived from the unit system. Liquid Today was
+    // the ONLY one of them missing it — which is why its Skin Temp card could not honour the preference
+    // even once it had a value to show (#1627).
+    @AppStorage(UnitPrefs.systemKey) private var unitSystemRaw = UnitSystem.metric.rawValue
+    private var unitSystem: UnitSystem { UnitSystem(rawValue: unitSystemRaw) ?? .metric }
+    @AppStorage(UnitPrefs.temperatureKey) private var temperatureRaw = ""
+    private var temperatureUnit: TemperatureUnit {
+        UnitPrefs.resolveTemperature(system: unitSystem, override: temperatureRaw)
     }
 
     // The user's Effort display scale (#268), 0–100 by default or the WHOOP 0–21 axis if chosen — the SAME

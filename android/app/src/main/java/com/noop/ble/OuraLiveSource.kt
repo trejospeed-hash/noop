@@ -52,6 +52,32 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 /**
+ * The label a discovered ring is listed under: its advertised local name, or [fallback] when it did not
+ * advertise one.
+ *
+ * A BONDED ring routinely stops advertising a local name, so the blank case is the NORMAL case for the
+ * ring a user most wants to reconnect to (#1776), not an error path - the scan's ScanFilter is the only
+ * gate and the name is a label. Callers therefore never see a blank `DiscoveredRing.name`, which is why
+ * the wizard renders it unguarded on both platforms (#1783 reads that as a missing guard; the guard is
+ * here, at the single construction site).
+ *
+ * BLANK, not empty. `isBlank` treats an all-whitespace name as absent; the Swift twin
+ * `ouraAdvertisedLabel` in `Strand/BLE/OuraLiveSource.swift` used `isEmpty`, which does not, so a ring
+ * advertising `" "` listed as "Oura" here and blank there - the exact silent Kotlin/Swift divergence the
+ * parity contract calls out. Both sides now treat whitespace as absent and return the name UNTRIMMED
+ * when it is present, and `OuraNamelessRingDiscoveryTest` pins this function against the Swift twin's
+ * own output. The two agree over ASCII whitespace, ordinary names, and U+00A0. `ifBlank` does NOT test
+ * `Character.isWhitespace`, which would indeed exclude U+00A0; it tests Kotlin's `Char.isWhitespace`,
+ * defined as `Character.isWhitespace(c) || Character.isSpaceChar(c)`, and the second disjunct restores
+ * every non-breaking space the first drops. The pair parts only on U+0085 (blank on Apple, not here)
+ * and U+001C-U+001F (blank here, not on Apple), which no BLE local name carries - stated rather than
+ * silently overclaimed.
+ */
+internal fun ouraAdvertisedLabel(advertisedName: String, fallback: String): String =
+    advertisedName.ifBlank { fallback }
+
+
+/**
  * EXPERIMENTAL, ISOLATED live-BLE source for the Oura ring (gen3 / gen4 / gen5).
  *
  * Faithful Kotlin twin of Strand/BLE/OuraLiveSource.swift. This replaced an earlier honest dead-end
@@ -230,7 +256,8 @@ class OuraLiveSource(
      * connecting, so the fresh per-connection driver is built with `allowKeyInstall == true` and the
      * dangerous install can run for exactly that session. It takes effect on the next connect (the driver
      * is re-created per connection); a connection already mid-flight is not retro-granted. Default-false
-     * everywhere else keeps the dangerous opcode unreachable. Kotlin twin of Swift's `setAdoptIntent`.
+     * everywhere else keeps the dangerous opcode unreachable. On Swift, the architectural counterpart is
+     * the immutable `OuraLiveSource.adoptIntent` initializer input; there is no setter twin.
      */
     fun setAdoptIntent(intent: Boolean) {
         adoptIntent = intent
@@ -869,8 +896,9 @@ class OuraLiveSource(
             log("Oura: Bluetooth adapter is off - cannot scan")
             return
         }
-        // Filter by the ring's base service so a broad scan does not surface unrelated peripherals; the
-        // callback further confirms the advertised name reads as an Oura ring.
+        // Filter by the ring's base service so a broad scan does not surface unrelated peripherals. This
+        // ScanFilter is the ONLY discovery gate — the callback does not re-filter on the advertised name,
+        // because a bonded ring often advertises none; see the note in `scanCallback`.
         val filter = ScanFilter.Builder()
             .setServiceUuid(ParcelUuid(SERVICE_UUID))
             .build()
@@ -996,6 +1024,18 @@ class OuraLiveSource(
         hypnogramAssembler.flush()?.let { persistHypnogramBurst(it) }
         drainPendingAnchorEvents()
         dropUnanchoredHypnogramBursts()
+        // #1526 follow-up, twin of the Swift `stop()` call: cancelling the re-engage does NOT stop the
+        // ring. That is the "just stop poking it" assumption #1526's captures falsified -- daytime-HR
+        // left in mode 0x01 kept pushing green 0x80 all night, and the ring's ~20 s auto-revert never
+        // fired. A teardown that only cancels the timer therefore hands back a ring still in daytime
+        // mode, blocking its own sleep suite. Send the same disable + unsubscribe pair before the link
+        // goes, and BEFORE driver.stop() so the phase check below still sees Streaming.
+        //
+        // Best-effort by nature: WRITE_TYPE_NO_RESPONSE goes to the controller immediately, but the
+        // disconnect follows in the next statement and nothing guarantees a flush. It closes the common
+        // cases -- user disconnect, source switch, Bluetooth off -- and a process kill cannot be covered
+        // at all, which is a transport limit rather than a gap in this fix.
+        disableLiveHR()
         driver?.stop()
         gatt?.let { runCatching { it.disconnect(); it.close() } }
         gatt = null
@@ -1086,16 +1126,21 @@ class OuraLiveSource(
             val device = result.device ?: return
             val address = device.address ?: return
             val name = result.scanRecord?.deviceName ?: runCatching { device.name }.getOrNull() ?: ""
-            // Confirm the advertised name reads as an Oura ring (the service filter is the primary gate;
-            // this rejects anything that slipped through advertising the same base service).
-            if (ExperimentalBrand.recognise(name) != ExperimentalBrand.OURA) return
             val firstSight = seen.put(address, device) == null   // null → not seen before this scan
-            if (firstSight) log("Oura: found $name ($address) rssi ${result.rssi}")
-            // Best-effort generation guess from the advertised name (confirmed by the model the user picks).
+            if (firstSight) log("Oura: found ${ouraAdvertisedLabel(name, "Oura ring")} ($address) rssi ${result.rssi}")
+            // Best-effort generation guess from the advertised name — a LABEL only (the wizard falls back
+            // to GEN3 when it is null). Nothing is dropped here: startScan's ScanFilter pins SERVICE_UUID in
+            // the BT stack, so that is the gate, and a ring is listed even when it advertises no local name
+            // at all. This callback USED TO drop a nameless device (`ExperimentalBrand.recognise(name) !=
+            // OURA`, and `recognise("")` is null because no brand token is a substring of ""), so a BONDED
+            // ring — which often stops advertising a local name, and whose Android `device.name` bond-cache
+            // fallback is empty when the bond lives elsewhere — was the one ring the wizard could not show.
+            // Twin of the Apple side (Strand/BLE/OuraLiveSource.swift), which has always listed on the
+            // service filter alone. Do not re-add a name-based drop here.
             val detectedGen = OuraRingGen.recognise(name)
             val ring = DiscoveredRing(
                 address = address,
-                name = name.ifBlank { "Oura" },
+                name = ouraAdvertisedLabel(name, "Oura"),
                 rssi = result.rssi,
                 detectedGen = detectedGen,
             )
@@ -1399,6 +1444,22 @@ class OuraLiveSource(
             log("Oura: the ring did not accept the key (status=${status ?: "none"}) - cannot adopt this ring")
             announceNeedsPairing(KEY_INSTALL_MESSAGE)
         }
+    }
+
+    /**
+     * Hand the ring back out of daytime-HR mode: the feature-mode write plus the unsubscribe the enable
+     * triplet leaves standing. Twin of Swift `OuraLiveSource.disableLiveHR`.
+     *
+     * `liveHRDisable` alone only touches the MODE byte, so without the unsubscribe the notification
+     * channel stays open for the ring's own adaptive sampling to push through -- which is why #1526
+     * corrected the byte (0x01 "automatic" was never "off") and added the pair. The Streaming guard
+     * covers the callers: there is nothing to disable if the session never got that far.
+     */
+    private fun disableLiveHR() {
+        val d = driver ?: return
+        if (d.phase != OuraDriverPhase.Streaming) return
+        write(OuraCommands.liveHRDisable())
+        write(OuraCommands.liveHRUnsubscribe())
     }
 
     /** Write one built command to the ring's write characteristic (Write Without Response). Logged by its
@@ -1780,8 +1841,10 @@ class OuraLiveSource(
                     // Other Tier-B tags (real_steps / activity-summary / sleep-summary / smoothed-SpO2,
                     // OURA_PROTOCOL.md s7.3; PR #960): logged ONCE PER KIND with the raw bytes so we can
                     // see whether the ring sends these tags at all and collect capture material - e.g.
-                    // real_steps 0x7E/0x7F is server-flag-gated OFF by default ([open_oura-feat]), so its
-                    // continued absence here is the ring's doing, not a decode gap.
+                    // real_steps 0x7E/0x7F was assumed server-flag-gated OFF ([open_oura-feat]), which
+                    // made its absence self-explanatory. That no longer holds: the ring's own status read
+                    // came back ENABLED on-device (#1629), so gating does NOT explain why these tags never
+                    // arrive, and whether that is the ring's doing or a decode gap is currently unknown.
                     if (loggedTierBKinds.add(e.value.kind)) {
                         val hex = e.value.rawPayload.joinToString(" ") { "%02x".format(it) }
                         log("Oura: Tier-B ${e.value.kind} seen (tag 0x${e.value.tag.toString(16)}) - raw: $hex")

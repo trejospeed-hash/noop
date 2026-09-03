@@ -45,12 +45,12 @@ import kotlin.math.roundToInt
  * macOS SleepView.stageBreakdownRows. (PipBar)
  */
 @Composable
-internal fun StageBreakdownRows(s: Stages) {
+internal fun StageBreakdownRows(s: Stages, palette: SleepStagePalette = SleepStagePalette.NOOP) {
     Column(verticalArrangement = Arrangement.spacedBy(Metrics.space12)) {
-        StageBreakdownRow("REM", s.rem, s.total, Palette.sleepREM, stageSharePercent("REM", s))
-        StageBreakdownRow("Deep", s.deep, s.total, Palette.sleepDeep, stageSharePercent("Deep", s))
-        StageBreakdownRow("Light", s.light, s.total, Palette.sleepLight, stageSharePercent("Light", s))
-        StageBreakdownRow("Awake", s.awake, s.total, Palette.sleepAwake, stageSharePercent("Awake", s))
+        StageBreakdownRow("REM", s.rem, s.total, stageColorForRamp("REM", palette), stageSharePercent("REM", s))
+        StageBreakdownRow("Deep", s.deep, s.total, stageColorForRamp("Deep", palette), stageSharePercent("Deep", s))
+        StageBreakdownRow("Light", s.light, s.total, stageColorForRamp("Light", palette), stageSharePercent("Light", s))
+        StageBreakdownRow("Awake", s.awake, s.total, stageColorForRamp("Awake", palette), stageSharePercent("Awake", s))
     }
 }
 
@@ -238,7 +238,9 @@ internal fun FilledHypnogram(
     // stranding the axis at just onset/mid/wake; a tablet fans out to the 8-label ceiling. Floor 4 keeps a
     // narrow phone from collapsing back to bare edges.
     val maxAxisLabels = (LocalConfiguration.current.screenWidthDp / 60).coerceIn(4, 8)
-    val is24h = DateFormat.is24HourFormat(LocalContext.current)
+    // #1821: the reader's CHOSEN clock, not the raw device switch. Reading the device here would have
+    // left the hypnogram axis in 24h while the sleep card above it changed - the setting half-applied.
+    val is24h = ClockPrefs.uses24Hour(LocalContext.current)
     val axisTicks = if (showsAxis) hypnogramAxisTicks(onsetTs!!, wakeTs!!, maxAxisLabels, is24h) else emptyList()
     Column(verticalArrangement = Arrangement.spacedBy(Metrics.space6)) {
         Canvas(
@@ -325,7 +327,14 @@ internal fun FilledHypnogram(
 }
 
 /** A compact colour-coded key for the stepped hypnogram: one dot + label per stage in the chart's ramp, so
- *  the bands are decodable (esp. the Garmin ramp's two pinks, Awake vs REM). Twin of Swift SleepStageLegend. */
+ *  the bands are decodable (esp. the Garmin ramp's two pinks, Awake vs REM). Twin of Swift SleepStageLegend.
+ *
+ *  NOTHING RENDERS THIS (#1536). Its only call sites put it above [StageBreakdownRows], whose rows carry
+ *  their own text labels — so it decoded something already named, listed the stages in a different order
+ *  than the rows, and drew RAMP colours while those rows use fixed [Palette] tokens, which made its dots
+ *  disagree with the swatches beneath them on any non-NOOP ramp. Kept, not deleted: it is the only code
+ *  that knows how to build this key, and a genuinely unlabelled hypnogram is exactly what it is for. Wire
+ *  it to one of those, not to a labelled table. */
 @Composable
 internal fun SleepStageLegend(palette: SleepStagePalette) {
     Row(
@@ -429,9 +438,10 @@ private fun hypnogramSummaryFor(intervals: List<StageInterval>): String =
  */
 @Composable
 internal fun ClockLabelRow(onsetTs: Long, wakeTs: Long) {
-    val onset = clockTimeLabel(onsetTs)
-    val mid = clockTimeLabel((onsetTs + wakeTs) / 2L)
-    val wake = clockTimeLabel(wakeTs)
+    val is24h = ClockPrefs.uses24Hour(LocalContext.current)   // #1821
+    val onset = clockTimeLabel(onsetTs, is24h)
+    val mid = clockTimeLabel((onsetTs + wakeTs) / 2L, is24h)
+    val wake = clockTimeLabel(wakeTs, is24h)
     Row(modifier = Modifier.fillMaxWidth()) {
         Text(
             onset,

@@ -53,6 +53,7 @@ import androidx.compose.material.icons.filled.LocalFireDepartment
 import androidx.compose.material.icons.filled.MonitorHeart
 import androidx.compose.material.icons.filled.MonitorWeight
 import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.Thermostat
 import androidx.compose.material.icons.filled.Timeline
 import androidx.compose.material.icons.filled.TrackChanges
 import androidx.compose.material.icons.filled.WaterDrop
@@ -251,6 +252,9 @@ private data class TodayLiveSnapshot(
     val lastSyncAt: Long?,
     val backfilling: Boolean,
     val syncChunksThisSession: Int,
+    /** Mirrors `LiveState.historyReady` — whether this strap can actually hand over history. Flips at
+     *  most once per connection, so it costs the snapshot nothing. */
+    val historyReady: Boolean,
     val historySyncExperimental: Boolean,
     val batteryPct: Double?,
     /** True once a WHOOP 5/MG strap has been seen this session, picks the 5/MG rated-life fallback for the
@@ -282,6 +286,9 @@ fun TodayScreen(
     // wrongly dumping into the Health monitor). Mirrors the iOS liquidCard `metricDetail(key)`. Takes the
     // vital_detail key; defaults to the Health screen so an unbound caller keeps the old behaviour.
     onOpenMetric: (String) -> Unit = { onOpenHealth() },
+    // A blank WHOOP 4.0 Steps tile can open calibration directly (#1515). AppRoot binds this to the same
+    // nested destination Settings uses; other Steps states continue through [onOpenMetric].
+    onOpenStepsCalibration: () -> Unit = {},
     onOpenSleep: () -> Unit = {},
     // Optional Coupled view card (task #43): a tap-through to the WHOOP-style day screen. Defaulted to a
     // no-op so the call site stays compiling; AppRoot binds it to nav.navigate(CoupledView).
@@ -328,6 +335,7 @@ fun TodayScreen(
                 lastSyncAt = s.lastSyncAt,
                 backfilling = s.backfilling,
                 syncChunksThisSession = s.syncChunksThisSession,
+                historyReady = s.historyReady,
                 historySyncExperimental = s.historySyncExperimental,
                 batteryPct = s.batteryPct,
                 whoop5 = s.whoop5Detected,
@@ -659,6 +667,9 @@ fun TodayScreen(
     // existing RecoveryDriversSection (gated to the calibration countdown when the night can't score) plus
     // the folded Readiness card (S4). Not persisted, so it reopens closed. Mirrors iOS showChargeBreakdown.
     var showChargeBreakdown by remember { mutableStateOf(false) }
+    // #1694: the Latest-Workouts tile that was tapped. Held HERE, not inside the section: the Today
+    // sections are LazyColumn items, and a disposed item would take an open sheet down with it.
+    var selectedWorkoutRow by remember { mutableStateOf<WorkoutRow?>(null) }
     // LIVE SESSIONS (beta, default ON): the "Start session" entry under the hero + its full-screen Dialog
     // (the same presentation the live-workout overlay / Charge breakdown use — deliberately NOT a nav
     // destination, so dismissing it leaves the session's runner coaching and this entry is the way back
@@ -927,6 +938,7 @@ fun TodayScreen(
                 hr = todayHr,
                 maxHR = effMaxHR,
                 restingHR = displayMetric?.restingHr?.toDouble() ?: StrainScorer.defaultRestingHR,
+                method = NoopPrefs.effortMethod(context),
                 sex = profileStore.sex,
             )
         } else {
@@ -1066,7 +1078,7 @@ fun TodayScreen(
 
     // 14-day trailing calendar window ending on the phone's actual local day.
     // Old imports stay in history, but they do not fill the Today trend tiles.
-    val window = rememberTrendWindow(days, selectedDay, keyMetricsWindowDays)
+    val window = rememberTrendWindow(days, selectedDay, keyMetricsWindowDays, spo2CandidateByDay)
 
     LaunchedEffect(days) {
         // #849: this footer pass is the heavy one. It derives HR per imported workout from raw strap samples
@@ -1106,7 +1118,15 @@ fun TodayScreen(
             // fillWorkoutHrFromStrap: imported sessions carry no HR, derive it from strap samples (#77).
             // #510: strap-native rows now read HR under their OWN recording strap (inside the fill), so a 2nd
             // WHOOP's workouts reconcile Avg HR + Effort from their own trace; imported rows keep the default.
-            recentWorkouts = viewModel.repo.fillWorkoutHrFromStrap(recentUnion),
+            // #1601: the ACTIVE strap id, not the "my-whoop" default — see the AppViewModel call site.
+            // Left defaulted, an imported row on a non-canonical install reads only the canonical id here
+            // while every other surface reads active ∪ canonical, so its Avg HR stays blank against a
+            // populated graph.
+            recentWorkouts = viewModel.repo.fillWorkoutHrFromStrap(
+                recentUnion,
+                strapDeviceId = viewModel.deviceId,
+                effortMethod = NoopPrefs.effortMethod(context),
+            ),
             whoopDays = days.size,
             whoopWorkouts = whoopWorkouts.size,
             appleDays = appleDaysCount,
@@ -1136,7 +1156,8 @@ fun TodayScreen(
             onHorizontalDrag = { _, dragAmount -> accumulatedX += dragAmount },
         )
     }
-    val canPullToSync = todayPullToSyncEnabled(liveSnap.connected, liveSnap.bonded, liveSnap.backfilling)
+    val canPullToSync =
+        todayPullToSyncEnabled(liveSnap.connected, liveSnap.bonded, liveSnap.backfilling, liveSnap.historyReady)
     // material3 1.2.1's rememberPullToRefreshState CAPTURES the `enabled` lambda ONCE (rememberSaveable,
     // no rememberUpdatedState), so `{ canPullToSync }` would freeze the plain Boolean from the FIRST
     // composition — and Today usually first composes before the strap has (re)connected, leaving the
@@ -1144,7 +1165,11 @@ fun TodayScreen(
     // instead, so each gesture check sees the current connected/bonded/backfilling. (syncNow is triple-gated
     // anyway; this just makes the gesture actually enable once the strap is ready.)
     val pullToSyncState = rememberPullToRefreshState(
-        enabled = { todayPullToSyncEnabled(liveSnap.connected, liveSnap.bonded, liveSnap.backfilling) },
+        enabled = {
+            todayPullToSyncEnabled(
+                liveSnap.connected, liveSnap.bonded, liveSnap.backfilling, liveSnap.historyReady,
+            )
+        },
     )
     LaunchedEffect(pullToSyncState.isRefreshing, canPullToSync) {
         if (pullToSyncState.isRefreshing) {
@@ -1534,6 +1559,8 @@ fun TodayScreen(
                                     carriedDay = lastScoredRecoveryDay,
                                     spo2CarryDay = lastSpo2Day,
                                     respCarryDay = lastRespDay,
+                                    spo2CandidateByDay = spo2CandidateByDay,
+                                    skinTempCarryDay = lastSkinTempDay,
                                     unitSystem = unitSystem,
                                     effortScale = effortScale,
                                     effortForDay = effortForDay,   // #1001: same figure as the hero ring
@@ -1558,6 +1585,7 @@ fun TodayScreen(
                                     detailed = keyMetricsDetailed,
                                     windowDays = keyMetricsWindowDays,
                                     onOpenMetric = onOpenMetric,
+                                    onOpenStepsCalibration = onOpenStepsCalibration,
                                 )
                             }
                         }
@@ -1566,7 +1594,7 @@ fun TodayScreen(
                             modifier = Modifier.fillMaxWidth().staggeredAppear(stagger),
                             verticalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
-                            TodayWorkoutsSection(footer.recentWorkouts)
+                            TodayWorkoutsSection(footer.recentWorkouts, onSelect = { selectedWorkoutRow = it })
                         }
                         // HEART RATE, the live HR thread / trend card. #991: header + card in a Column.
                         TodaySection.HEART_RATE -> Column(
@@ -1725,6 +1753,11 @@ fun TodayScreen(
         }
     }
 
+    // #1694: the tapped Latest-Workouts session, in the same read-only sheet the Workouts list opens.
+    selectedWorkoutRow?.let { row ->
+        WorkoutDetailSheet(vm = viewModel, row = row, onDismiss = { selectedWorkoutRow = null })
+    }
+
     // LIVE SESSIONS (beta): the full-screen session dialog — the same presentation the live-workout
     // overlay uses on Live (Dialog, usePlatformDefaultWidth = false). Dismissing it only HIDES the
     // screen: the runner (held in LiveSessionRunner.active, ticking on the app-wide viewModelScope)
@@ -1837,9 +1870,17 @@ private fun WorkoutInProgressCard(
             kotlinx.coroutines.delay(1000)
         }
     }
-    val elapsedS = ((nowMs - workout.startMs) / 1000).coerceAtLeast(0)
+    val elapsedS = ActiveWorkoutClock.activeElapsedSeconds(
+        startMs = workout.startMs, pausedAtMs = workout.pausedAtMs,
+        pausedDurationMs = workout.pausedDurationMs, nowMs = nowMs,
+    )
     val elapsed = elapsedClock(elapsedS)
     val sportLabel = workout.sport.name
+    // The card below sets ONE contentDescription on a merged node, which REPLACES its children's
+    // semantics — so the visible "Paused" tag would be invisible to TalkBack unless it is folded in
+    // here. A frozen clock the screen reader cannot explain is worse than a running one.
+    val pausedSuffix =
+        if (workout.pausedAtMs != null) ", " + uiString(R.string.workout_action_paused) else ""
 
     // liquidPress on the whole tappable "return to workout" card (same interactionSource on clickable + press).
     val interaction = remember { MutableInteractionSource() }
@@ -1852,7 +1893,7 @@ private fun WorkoutInProgressCard(
             .liquidPress(interaction)
             .clickable(interactionSource = interaction, indication = null, onClick = onReturn)
             .semantics(mergeDescendants = true) {
-                contentDescription = uiString(R.string.l10n_today_screen_workout_in_progress_sportlabel_elapsed_return_95ce4bda, sportLabel, elapsed)
+                contentDescription = uiString(R.string.l10n_today_screen_workout_in_progress_sportlabel_elapsed_return_95ce4bda, sportLabel, elapsed) + pausedSuffix
             },
     ) {
         Column(verticalArrangement = Arrangement.spacedBy(Metrics.space12)) {
@@ -1871,6 +1912,16 @@ private fun WorkoutInProgressCard(
                     style = NoopType.overline,
                     color = Palette.metricRose,
                 )
+                // A frozen clock alone is ambiguous with a STALLED one, so say which it is. Reuses the
+                // string #1533 already localized rather than minting new copy for a tag.
+                if (workout.pausedAtMs != null) {
+                    Spacer(Modifier.width(Metrics.space8))
+                    Text(
+                        uiString(R.string.workout_action_paused),
+                        style = NoopType.overline,
+                        color = Palette.textSecondary,
+                    )
+                }
                 Spacer(Modifier.weight(1f))
                 Text(elapsed, style = NoopType.number(15f), color = Palette.textPrimary)
             }
@@ -3524,9 +3575,10 @@ private fun dashboardCardValue(
         DashboardCard.BLOOD_OXYGEN ->
             // PER-FIELD carry: the whole-row carries (vd) land on rows whose spo2Pct is null (the engine
             // writes spo2Pct = null on computed rows), so fall through to the last row that HAS one.
-            // #103: when no calibrated spo2Pct exists, fall back to the spo2_candidate_82 strap estimate
-            // (from metricSeries) when the experimental display toggle is ON. Labelled "estimate" in the
-            // Health vitals screen; here it just fills the card so it's not blank.
+            // #103/queue-11a: when no calibrated spo2Pct exists, fall back to the spo2_candidate strap
+            // estimate (WHOOP @82 or Oura ceiling@100, from metricSeries) when the experimental display
+            // toggle is ON. Labelled "estimate" in the Health vitals screen; here it just fills the card
+            // so it's not blank.
             (vd?.spo2Pct ?: spo2Day?.spo2Pct)?.let { String.format(Locale.getDefault(), "%.0f%%", it) }
                 ?: (vd?.day ?: day?.day)?.let { spo2CandidateByDay[it] }?.let { String.format(Locale.getDefault(), "%.0f%%", it) }
                 ?: NO_DATA
@@ -4848,6 +4900,18 @@ private fun RecordingStatusChip(state: RecordingState, onConnect: () -> Unit) {
 // `provenanceBadgeLabel` By-Day mappers are kept (Intelligence/Trends + tests still use that vocabulary).
 
 /**
+ * The Key Metrics Skin Temp tile's 3-way fallback: today's row, then the whole-row recovery carry,
+ * then the per-field skin-temp carry (mirrors spo2CarryDay/respCarryDay's reasoning — carriedDay can
+ * land on a row with null skinTempDevC even when a genuine reading exists further back). Extracted so
+ * the carry regression ryanbr's PR #1589 review flagged is testable without Compose/Robolectric.
+ */
+internal fun resolveSkinTempDevC(
+    d: DailyMetric?,
+    carriedDay: DailyMetric?,
+    skinTempCarryDay: DailyMetric?,
+): Double? = d?.skinTempDevC ?: carriedDay?.skinTempDevC ?: skinTempCarryDay?.skinTempDevC
+
+/**
  * The full 14-day metric grid, mirroring the macOS LazyVGrid order:
  * Charge, Effort, Rest, HRV, Resting HR, Blood Oxygen, Respiratory,
  * Steps, Weight, Calories. Each tile is a fixed-height [SparkStatTile] so the
@@ -4868,6 +4932,17 @@ private fun MetricGrid(
     // PER-FIELD respiratory carry (#1331): same reason as spo2CarryDay — respiratory needs a longer
     // clean sleep R-R segment than HRV, so carriedDay can land on a night with HRV but no breaths/min.
     respCarryDay: DailyMetric? = null,
+    // #1599: the same candidate map the tile's sparkline is built from, so the number and the line under
+    // it draw on one source rather than two. They are not guaranteed EQUAL — the value carries from
+    // outside the window and the line cannot — but neither can now show data the other has no access to,
+    // which is what made this tile render a number above a blank panel.
+    spo2CandidateByDay: Map<String, Double> = emptyMap(),
+    // PER-FIELD skin-temp carry (ryanbr review, PR #1589): same reason as spo2CarryDay/respCarryDay —
+    // carriedDay (lastScoredRecoveryDay) is a whole-row carry that lands on rows with null
+    // skinTempDevC, so the Key Metrics tile falls through to the last row that actually has a
+    // reading. Mirrors the "Your Cards" DashboardCard.SKIN_TEMP path's skinTempDay fallback and iOS
+    // TodayView's lastSkinTempDay chain.
+    skinTempCarryDay: DailyMetric? = null,
     unitSystem: UnitSystem = UnitSystem.METRIC,
     effortScale: EffortScale = EffortScale.HUNDRED,
     // #1001: the day's resolved Effort (live-preferring for today, floored at the stored row). Threaded
@@ -4917,7 +4992,16 @@ private fun MetricGrid(
     // Tile drill-ins: every tile opens its focused trend timeline (vital_detail/<key>, the Sleep
     // night-detail pattern) via [onOpenMetric].
     onOpenMetric: (String) -> Unit = {},
+    // Exception for the actionable blank WHOOP 4.0 state: it opens the canonical calibration screen.
+    onOpenStepsCalibration: () -> Unit = {},
 ) {
+    val realStepsForDay = d?.steps ?: importedStepsForDay
+    val stepsOpenCalibration = stepsTileShouldOpenCalibration(
+        realSteps = realStepsForDay,
+        estimatedSteps = estimatedStepsForDay,
+        calibrationPrompt = stepsCalibrationPrompt,
+    )
+
     // FIX 3 (iOS `keyMetricsSection` parity): a 3-COLUMN grid of COMPACT liquid tiles, each an iOS `ktile`
     // — a 9sp/+1.2 overline label, a value + small unit, and a thin 8dp LiquidTube fill bar — REPLACING the
     // old 2-column large sparkline cards. One descriptor per KeyMetric, carrying the SAME value/tint reads
@@ -4981,14 +5065,26 @@ private fun MetricGrid(
             )
         },
         KeyMetric.BLOOD_OXYGEN to run {
-            val v = d?.spo2Pct ?: carriedDay?.spo2Pct ?: spo2CarryDay?.spo2Pct
+            // Candidate LAST, after the carries — the exact precedence the dashboard Blood Oxygen card
+            // uses two sections down this same screen, and the one the Apple tile uses. The candidate is
+            // a fallback for having nothing, never an override for having something stale.
+            //
+            // For the strap-only install this issue is about there are no calibrated readings at all, so
+            // both carries are null and every surface resolves to the candidate regardless.
+            val calibrated = d?.spo2Pct ?: carriedDay?.spo2Pct ?: spo2CarryDay?.spo2Pct
+            val candidateToday = d?.day?.let { spo2CandidateByDay[it] }
+            val onCandidate = spo2UsingCandidate(calibrated, candidateToday)
+            val v = calibrated ?: candidateToday
             KeyTileData(
                 label = uiString(R.string.l10n_today_screen_blood_oxygen_a8ad9ff5),
                 value = v?.let { String.format(Locale.getDefault(), "%.0f", it) } ?: NO_DATA,
                 unit = if (v != null) "%" else "",
                 tint = Palette.metricCyan,
                 frac = v?.let { (it / 100.0).coerceIn(0.0, 1.0) },
-                spark = w.spo2,
+                // Say WHOSE number this is. The Apple tile has carried this caption all along; Android
+                // showed an unlabelled figure, which is the harder of the two to argue with.
+                caption = if (onCandidate) uiString(R.string.spo2_strap_estimate_caption) else null,
+                spark = spo2SparkSeries(w.spo2, w.spo2Candidate),
             )
         },
         KeyMetric.RESPIRATORY to run {
@@ -5004,8 +5100,7 @@ private fun MetricGrid(
         },
         KeyMetric.STEPS to run {
             // Steps precedence (unchanged): on-device count → imported → estimate. (#107/#150)
-            val realSteps = d?.steps ?: importedStepsForDay
-            val steps = realSteps ?: estimatedStepsForDay
+            val steps = realStepsForDay ?: estimatedStepsForDay
             KeyTileData(
                 label = uiString(R.string.l10n_today_screen_steps_cdde4f20),
                 value = steps?.let { intString(it.toDouble()) } ?: NO_DATA,
@@ -5016,7 +5111,7 @@ private fun MetricGrid(
                 // A measured count needs no explanation; an ESTIMATE says what it was fitted from
                 // (#760/#792); a BLANK tile on a strap that estimates says what would unblock it (#1491).
                 caption = when {
-                    realSteps != null -> null
+                    realStepsForDay != null -> null
                     estimatedStepsForDay != null -> stepsEstimateCaption
                     else -> stepsCalibrationPrompt
                 },
@@ -5045,6 +5140,25 @@ private fun MetricGrid(
                 spark = caloriesSpark,   // #616: imported-first trend (was missing → no trend line)
             )
         },
+        KeyMetric.SKIN_TEMP to run {
+            // Added 2026-08-24 (queue 11c follow-up): first Key Metrics appearance for Skin Temp — was
+            // already a "Your Cards" tile (DashboardCard.SKIN_TEMP), never a Key Metrics one. Same
+            // `d ?: carriedDay` idiom every other simple tile above uses (HRV/RESTING_HR), and the SAME
+            // `SkinTempDisplay` formatter the DashboardCard.SKIN_TEMP branch uses so a deviation reads
+            // "+0.1 Δ°C" identically on both surfaces (#622: bimodal absolute-vs-deviation field).
+            val v = resolveSkinTempDevC(d, carriedDay, skinTempCarryDay)
+            val fahrenheit = UnitPrefs.temperature(LocalContext.current) == TemperatureUnit.FAHRENHEIT
+            KeyTileData(
+                label = uiString(R.string.today_card_skin_temp),
+                // The value carries its own "°C"/"Δ°F" (SkinTempDisplay.format), so unit stays empty —
+                // same as the DashboardCard.SKIN_TEMP card and the classic TodayView Skin Temp tile.
+                value = v?.let { com.noop.analytics.SkinTempDisplay.format(it, fahrenheit = fahrenheit) } ?: NO_DATA,
+                unit = "",
+                tint = Palette.metricAmber,
+                frac = null,
+                spark = w.skinTemp,
+            )
+        },
     )
 
     // Resolve the enabled tiles to their descriptors (keeping the metric for the tap mapping), dropping
@@ -5063,9 +5177,13 @@ private fun MetricGrid(
         KeyMetric.RESTING_HR -> ({ onOpenMetric("rhr") })
         KeyMetric.BLOOD_OXYGEN -> ({ onOpenMetric("spo2") })
         KeyMetric.RESPIRATORY -> ({ onOpenMetric("resp") })
-        KeyMetric.STEPS -> ({ onOpenMetric("steps_est") })
+        KeyMetric.STEPS -> if (stepsOpenCalibration) onOpenStepsCalibration else ({ onOpenMetric("steps_est") })
         KeyMetric.CALORIES -> ({ onOpenMetric("active_kcal") })
         KeyMetric.WEIGHT -> null
+        // Same "skin" vital_detail key `dashboardCardMetricKey(DashboardCard.SKIN_TEMP)` already routes
+        // to — confirmed a working destination there, so this tile opens the SAME screen "Your Cards"
+        // already does, not a new/unverified route.
+        KeyMetric.SKIN_TEMP -> ({ onOpenMetric("skin") })
     }
     // S5: slice from the FRONT of the saved order so a pinned/selected tile is never dropped or reordered
     // (#251); only the tail folds behind the expander. Mirrors the iOS visibleKeyMetrics prefix(cap).
@@ -5121,6 +5239,15 @@ private fun MetricGrid(
     }
 }
 
+/** True only for the actionable #1515 state: the tile has no measured/imported count, no estimate, and
+ *  carries the WHOOP 4.0 calibration prompt. Real or estimated Steps always retain their trend drill-in;
+ *  a blank 5/MG or already-calibrated quiet day has no prompt and retains it too. */
+internal fun stepsTileShouldOpenCalibration(
+    realSteps: Int?,
+    estimatedSteps: Int?,
+    calibrationPrompt: String?,
+): Boolean = realSteps == null && estimatedSteps == null && calibrationPrompt != null
+
 /** One compact Key-Metrics tile's data: iOS `ktile`(label, value, unit, tint, frac). [spark] is the
  *  trailing trend series (oldest→newest) the DETAILED tile style graphs, capped at render to the editor's
  *  chosen window; empty hides the graph (a metric with no windowed series — Steps/Weight/Calories —
@@ -5152,6 +5279,8 @@ private fun keyMetricIcon(metric: KeyMetric): ImageVector = when (metric) {
     KeyMetric.STEPS -> Icons.AutoMirrored.Filled.DirectionsWalk
     KeyMetric.WEIGHT -> Icons.Filled.MonitorWeight
     KeyMetric.CALORIES -> Icons.Filled.LocalFireDepartment
+    // Same glyph the sibling "Your Cards" tile (DashboardCard.SKIN_TEMP) already uses.
+    KeyMetric.SKIN_TEMP -> Icons.Filled.Thermostat
 }
 
 /**
@@ -6101,7 +6230,7 @@ private fun WorkoutGlyph(icon: ImageVector, modifier: Modifier = Modifier) {
 // MARK: - Today footer sections
 
 @Composable
-private fun TodayWorkoutsSection(workouts: List<WorkoutRow>) {
+private fun TodayWorkoutsSection(workouts: List<WorkoutRow>, onSelect: (WorkoutRow) -> Unit) {
     // Single column, newest first: the 2x2 grid truncated durations on narrow phones and read as
     // unrelated stat tiles rather than a chronological feed. Full-width tiles have room for the
     // kcal chip, so the #332 compactDelta workaround is no longer needed here.
@@ -6111,10 +6240,22 @@ private fun TodayWorkoutsSection(workouts: List<WorkoutRow>) {
     // "Latest Workouts", not "Last": "Last" read as "final". Mirrored on iOS (TodayView). Lives in
     // strings.xml (values + values-de) so the header is localizable like the nav labels.
     SectionHeader(stringResource(R.string.today_latest_workouts), overline = uiString(R.string.today_workouts_activity), trailing = uiString(R.string.today_workouts_14_days))
+    // #1694: the feed was read-only, so the only way to a session's detail was More > Workouts. The
+    // tap opens the SAME read-only WorkoutDetailSheet the Workouts list uses — nothing there can edit
+    // or delete, so a tap from Today carries no risk that list does not already carry.
     Column(verticalArrangement = Arrangement.spacedBy(Metrics.gap)) {
         feed.forEach { workout ->
+            val interaction = remember(workout.startTs, workout.source) { MutableInteractionSource() }
             StatTile(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .liquidPress(interaction)
+                    .clickable(
+                        interactionSource = interaction,
+                        indication = null,
+                        onClickLabel = uiString(R.string.today_action_show_workout),
+                        onClick = { onSelect(workout) },
+                    ),
                 label = WorkoutEditing.displaySport(workout.sport),
                 value = localizedMetricValue(workoutDuration(workout)),
                 caption = workoutCaption(workout),
@@ -6641,12 +6782,17 @@ private data class Window(
     val hrv: List<Double>,
     val rhr: List<Double>,
     val spo2: List<Double>,
+    /** #1599: the strap-estimate trend, kept separate from [spo2] so the tile can swap rather than mix. */
+    val spo2Candidate: List<Double> = emptyList(),
     val resp: List<Double>,
     // #616: the Steps tile carried no `spark` series, so it drew no trend line while every other tile did.
     // On-device DailyMetric.steps (the strap @57 count) — the same signal the Steps tile VALUE reads
     // (on-device-first), matching iOS kSparks "steps". (Calories is imported-first, so its spark is threaded
     // separately as caloriesSpark, not read off a DailyMetric column here.)
     val steps: List<Double>,
+    // Added 2026-08-24 (queue 11c follow-up) for the new Skin Temp Key Metrics tile — matches the iOS
+    // `sparks["skin_temp"]` sparkline added at the same time.
+    val skinTemp: List<Double>,
 )
 
 /**
@@ -6659,8 +6805,15 @@ private fun rememberTrendWindow(
     days: List<com.noop.data.DailyMetric>,
     anchorDay: LocalDate,
     windowDays: Int,
+    // #1599: the SpO2 candidate per day, so the Blood Oxygen tile has a series to draw at all.
+    // `AnalyticsEngine` writes `spo2Pct = null` on every computed day — a calibrated reading only ever
+    // arrives from an IMPORT — so on a strap-only install `series { it.spo2Pct }` is empty by
+    // construction and the tile rendered a value above blank space where every neighbour had a line.
+    // Already empty when the display toggle is off (the flow returns emptyMap), so reading it here needs
+    // no second gate.
+    spo2Candidate: Map<String, Double> = emptyMap(),
 ): Window =
-    androidx.compose.runtime.remember(days, anchorDay, windowDays) {
+    androidx.compose.runtime.remember(days, anchorDay, windowDays, spo2Candidate) {
         // Trailing CALENDAR days ending today, NOT the last N stored rows, which on an old import
         // were months-old data shown as a fresh trend (issue #23). ISO yyyy-MM-dd sorts chronologically.
         val cutoff = anchorDay.minusDays((windowDays - 1).toLong()).toString()
@@ -6674,8 +6827,12 @@ private fun rememberTrendWindow(
             hrv = series { it.avgHrv },
             rhr = series { it.restingHr?.toDouble() },
             spo2 = series { it.spo2Pct },
+            // #1599: the strap estimate as its OWN series, not merged into the one above. The tile swaps
+            // wholesale between them so a single caption can describe every point on the line.
+            spo2Candidate = recent.mapNotNull { spo2Candidate[it.day] },
             resp = series { it.respRateBpm },
             steps = series { it.steps?.toDouble() },   // #616
+            skinTemp = series { it.skinTempDevC },
         )
     }
 
@@ -6720,7 +6877,7 @@ private fun synthesisDetail(d: DailyMetric?): String {
         rec < 70 && d.totalSleepMin!! / 60.0 >= 7 -> R.string.today_synthesis_charge_steady_sleep_consistent
         rec < 70 -> R.string.today_synthesis_charge_steady_sleep_short
         d.totalSleepMin == null -> R.string.today_synthesis_charge_strong
-        d.totalSleepMin!! / 60.0 >= 7 -> R.string.today_synthesis_charge_strong_sleep_consistent
+        d.totalSleepMin / 60.0 >= 7 -> R.string.today_synthesis_charge_strong_sleep_consistent
         else -> R.string.today_synthesis_charge_strong_sleep_short
     }
     return uiString(res)
