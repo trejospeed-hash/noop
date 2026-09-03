@@ -60,19 +60,20 @@ jobs:
                 print('patched onChange in', path)
 
         def fix_scroll_bounce(path):
-            """Remove .scrollBounceBehavior modifier while preserving SwiftUI chain structure"""
+            """Remove entire #if os(iOS) block containing scrollBounceBehavior"""
             if not os.path.exists(path):
                 return
             with open(path, 'r') as f:
                 content = f.read()
             
-            # Remove .scrollBounceBehavior(...) including leading whitespace
-            new_content = re.sub(r'\s*\.scrollBounceBehavior\([^)]*\)', '', content)
+            # Remove the entire #if os(iOS) ... #endif block containing scrollBounceBehavior
+            pattern = r'\s*#if os\(iOS\)\s*\n\s*\.scrollBounceBehavior\([^)]*\)\s*\n\s*#endif'
+            new_content = re.sub(pattern, '', content)
             
             if new_content != content:
                 with open(path, 'w') as f:
                     f.write(new_content)
-                print('patched scrollBounceBehavior in', path)
+                print('patched scrollBounceBehavior block in', path)
 
         # Apply all patches to all Swift files
         for d in ['Strand', 'StrandiOS', 'StrandiOSShared', 'StrandiOSWidgets']:
