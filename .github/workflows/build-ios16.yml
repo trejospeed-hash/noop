@@ -73,14 +73,176 @@ jobs:
                 open(path, 'w').write(c2)
                 print('patched', path)
 
-        fix_timer('Strand/Screens/IntervalTimerView.swift')
+        def fix_timer(path):
+            if not os.path.exists(path):
+                return
+            lines = open(path).readlines()
+            out, i = [], 0
+            while i < len(lines):
+                if '.sensoryFeedback(trigger:' in lines[i]:
+                    depth = 0
+                    while i < len(lines):
+                        depth += lines[i].count('{') - lines[i].count('}')
+                        i += 1
+                        if depth == 0:
+                            break
+                    continue
+                out.append(lines[i])
+                i += 1
+            open(path, 'w').writelines(out)
+            print('patched', path)
+
+        def fix_scaffold(path):
+            if not os.path.exists(path):
+                return
+            lines = open(path).readlines()
+            targets = [i for i, l in enumerate(lines) if '.scrollBounceBehavior(' in l and not l.strip().startswith('//')]
+            for idx in reversed(targets):
+                start = idx
+                while start > 0 and '#if os(iOS)' not in lines[start]:
+                    start -= 1
+                end = idx
+                while end < len(lines) and '#endif' not in lines[end]:
+                    end += 1
+                del lines[start:end + 1]
+            open(path, 'w').writelines(lines)
+            print('patched', path)
+
+        def fix_onchange(path):
+            c = open(path).read()
+            c2 = re.sub(r'\.onChange\(of: ([^)]*)\) \{ _, ([A-Za-z_][A-Za-z0-9_]*) in', r'.onChange(of: python3 << 'PYEOF'
+        import re, os
+
+        def fix_timer(path):
+            if not os.path.exists(path):
+                return
+            lines = open(path).readlines()
+            out, i = [], 0
+            while i < len(lines):
+                if '.sensoryFeedback(trigger:' in lines[i]:
+                    depth = 0
+                    while i < len(lines):
+                        depth += lines[i].count('{') - lines[i].count('}')
+                        i += 1
+                        if depth == 0:
+                            break
+                    continue
+                out.append(lines[i])
+                i += 1
+            open(path, 'w').writelines(out)
+            print('patched', path)
+
+        def fix_scaffold(path):
+            if not os.path.exists(path):
+                return
+            lines = open(path).readlines()
+            targets = [i for i, l in enumerate(lines) if '.scrollBounceBehavior(' in l and not l.strip().startswith('//')]
+            for idx in reversed(targets):
+                start = idx
+                while start > 0 and '#if os(iOS)' not in lines[start]:
+                    start -= 1
+                end = idx
+                while end < len(lines) and '#endif' not in lines[end]:
+                    end += 1
+                del lines[start:end + 1]
+            open(path, 'w').writelines(lines)
+            print('patched', path)
+
+        def fix_onchange(path):
+            c = open(path).read()
+            c2 = re.sub(r'\.onChange\(of: ([^)]*)\) \{ _, ([A-Za-z_][A-Za-z0-9_]*) in', r'.onChange(of: \1) { \2 in', c)
+            c2 = re.sub(r'\.onChange\(of: ([^)]*)\) \{ _, _ in', r'.onChange(of: \1) { _ in', c2)
+            if c2 != c:
+                open(path, 'w').write(c2)
+                print('patched', path)
+
+) {         fix_timer('Strand/Screens/IntervalTimerView.swift')
         fix_scaffold('Strand/Screens/ScreenScaffold.swift')
         for d in ['Strand', 'StrandiOS', 'StrandiOSShared']:
             for root, _, files in os.walk(d):
                 for f in files:
                     if f.endswith('.swift'):
                         fix_onchange(os.path.join(root, f))
+        print('All patches applied') in', c)
+            c2 = re.sub(r'\.onChange\(of: ([^)]*)\) \{ _, _ in', r'.onChange(of: python3 << 'PYEOF'
+        import re, os
+
+        def fix_timer(path):
+            if not os.path.exists(path):
+                return
+            lines = open(path).readlines()
+            out, i = [], 0
+            while i < len(lines):
+                if '.sensoryFeedback(trigger:' in lines[i]:
+                    depth = 0
+                    while i < len(lines):
+                        depth += lines[i].count('{') - lines[i].count('}')
+                        i += 1
+                        if depth == 0:
+                            break
+                    continue
+                out.append(lines[i])
+                i += 1
+            open(path, 'w').writelines(out)
+            print('patched', path)
+
+        def fix_scaffold(path):
+            if not os.path.exists(path):
+                return
+            lines = open(path).readlines()
+            targets = [i for i, l in enumerate(lines) if '.scrollBounceBehavior(' in l and not l.strip().startswith('//')]
+            for idx in reversed(targets):
+                start = idx
+                while start > 0 and '#if os(iOS)' not in lines[start]:
+                    start -= 1
+                end = idx
+                while end < len(lines) and '#endif' not in lines[end]:
+                    end += 1
+                del lines[start:end + 1]
+            open(path, 'w').writelines(lines)
+            print('patched', path)
+
+        def fix_onchange(path):
+            c = open(path).read()
+            c2 = re.sub(r'\.onChange\(of: ([^)]*)\) \{ _, ([A-Za-z_][A-Za-z0-9_]*) in', r'.onChange(of: \1) { \2 in', c)
+            c2 = re.sub(r'\.onChange\(of: ([^)]*)\) \{ _, _ in', r'.onChange(of: \1) { _ in', c2)
+            if c2 != c:
+                open(path, 'w').write(c2)
+                print('patched', path)
+
+) { _ in', c2)
+            if c2 != c:
+                open(path, 'w').write(c2)
+                print('patched', path)
+
+        def fix_scroll_bounce(path):
+            """Remove .scrollBounceBehavior calls that require iOS 16.4+"""
+            if not os.path.exists(path):
+                return
+            with open(path, 'r') as f:
+                lines = f.readlines()
+            
+            filtered_lines = [l for l in lines if '.scrollBounceBehavior(' not in l]
+            
+            if len(filtered_lines) != len(lines):
+                with open(path, 'w') as f:
+                    f.writelines(filtered_lines)
+                print('patched scrollBounceBehavior in', path)
+
+        fix_timer('Strand/Screens/IntervalTimerView.swift')
+        fix_scaffold('Strand/Screens/ScreenScaffold.swift')
+        
+        # Apply patches to all Swift files
+        for d in ['Strand', 'StrandiOS', 'StrandiOSShared']:
+            for root, _, files in os.walk(d):
+                for f in files:
+                    if f.endswith('.swift'):
+                        filepath = os.path.join(root, f)
+                        fix_onchange(filepath)
+                        fix_scroll_bounce(filepath)
+        
         print('All patches applied')
+
         PYEOF
 
     - name: Generate Xcode project
