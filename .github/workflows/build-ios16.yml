@@ -15,6 +15,46 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Prepare release notes
+      id: release_meta
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        VERSION="$(awk -F'"' '/MARKETING_VERSION:/ { print $2; exit }' project.yml)"
+        SHORT_SHA="$(git rev-parse --short HEAD)"
+        DOWNLOAD_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/latest-ios16/NOOP_iOS16_TrollStore.ipa"
+        PREVIOUS_SHA="$(git rev-list -n 1 latest-ios16 2>/dev/null || true)"
+
+        if [ -n "$PREVIOUS_SHA" ] && git merge-base --is-ancestor "$PREVIOUS_SHA" HEAD; then
+          CHANGELOG="$(git log --oneline --no-merges "${PREVIOUS_SHA}..HEAD" | head -20 || true)"
+        else
+          CHANGELOG="$(git log --oneline --no-merges -20 || true)"
+        fi
+
+        if [ -z "$CHANGELOG" ]; then
+          CHANGELOG="No new non-merge commits detected."
+        fi
+
+        {
+          echo "version=${VERSION}"
+          echo "short_sha=${SHORT_SHA}"
+          echo "download_url=${DOWNLOAD_URL}"
+          echo "subject=NOOP iOS 16.3.1 actualizado - ${VERSION}/${SHORT_SHA}"
+          echo "body<<MAIL_BODY_EOF"
+          echo "NOOP iOS 16.3.1 actualizado"
+          echo
+          echo "Version: ${VERSION}"
+          echo "Commit: ${GITHUB_SHA}"
+          echo "IPA: ${DOWNLOAD_URL}"
+          echo
+          echo "Cambios recientes:"
+          echo "${CHANGELOG}"
+          echo "MAIL_BODY_EOF"
+        } >> "$GITHUB_OUTPUT"
 
     - name: Select latest Xcode
       run: |
@@ -28,85 +68,99 @@ jobs:
       run: |
         sed -i '' 's/deploymentTarget: "17.0"/deploymentTarget: "16.3"/g' project.yml
         python3 << 'PYEOF'
-        import re, os
+        import os
+        import re
+        from pathlib import Path
 
-        def fix_timer(path):
-            if not os.path.exists(path):
-                return
-            lines = open(path).readlines()
-            out, i = [], 0
-            while i < len(lines):
-                if '.sensoryFeedback(trigger:' in lines[i]:
-                    depth = 0
-                    while i < len(lines):
-                        depth += lines[i].count('{') - lines[i].count('}')
-                        i += 1
-                        if depth == 0:
-                            break
+        ROOTS = [Path('Strand'), Path('StrandiOS'), Path('StrandiOSShared'), Path('StrandiOSWidgets')]
+        COMPAT_PATH = Path('Strand/System/IOS16CIPatches.swift')
+        SCROLL_HELPER = '.noopScrollBounceBehaviorBasedOnSizeHorizontal()'
+        SCROLL_RE = re.compile(r'\.scrollBounceBehavior\(\s*\.basedOnSize\s*,\s*axes:\s*\.horizontal\s*\)')
+        ONCHANGE_NEW_VALUE_RE = re.compile(
+            r'\.onChange\(of:\s*([^)]+)\)\s*\{\s*_,\s*([A-Za-z_][A-Za-z0-9_]*)\s+in'
+        )
+        ONCHANGE_UNUSED_RE = re.compile(
+            r'\.onChange\(of:\s*([^)]+)\)\s*\{\s*_,\s*_\s+in'
+        )
+
+        COMPAT_SOURCE = """#if os(iOS)
+        import SwiftUI
+
+        extension View {
+            @ViewBuilder
+            func noopScrollBounceBehaviorBasedOnSizeHorizontal() -> some View {
+                if #available(iOS 16.4, *) {
+                    self.scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+                } else {
+                    self
+                }
+            }
+        }
+        #endif
+        """
+
+        def swift_files():
+            for root in ROOTS:
+                if not root.exists():
                     continue
-                out.append(lines[i])
-                i += 1
-            open(path, 'w').writelines(out)
-            print('patched sensoryFeedback in', path)
+                for path in root.rglob('*.swift'):
+                    if path != COMPAT_PATH:
+                        yield path
 
-        def fix_onchange(path):
-            if not os.path.exists(path):
-                return
-            c = open(path).read()
-            c2 = re.sub(r'\.onChange\(of: ([^)]*)\) \{ _, ([A-Za-z_][A-Za-z0-9_]*) in', r'.onChange(of: \1) { \2 in', c)
-            c2 = re.sub(r'\.onChange\(of: ([^)]*)\) \{ _, _ in', r'.onChange(of: \1) { _ in', c2)
-            if c2 != c:
-                open(path, 'w').write(c2)
-                print('patched onChange in', path)
+        def write_if_changed(path, content):
+            old = path.read_text() if path.exists() else None
+            if old != content:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content)
+                return True
+            return False
 
-        def fix_scroll_bounce_blocks(path):
-            """Remove entire #if os(iOS) blocks containing scrollBounceBehavior"""
-            if not os.path.exists(path):
-                return
-            lines = open(path).readlines()
-            out = []
-            i = 0
-            while i < len(lines):
-                # Check if this is an #if os(iOS) block
-                if lines[i].strip() == '#if os(iOS)':
-                    # Look ahead to see if this block contains scrollBounceBehavior
-                    block_start = i
-                    j = i + 1
-                    found_scroll_bounce = False
-                    while j < len(lines):
-                        if lines[j].strip() == '#endif':
-                            # Check if we found scrollBounceBehavior in this block
-                            block_content = ''.join(lines[block_start:j+1])
-                            if '.scrollBounceBehavior(' in block_content:
-                                found_scroll_bounce = True
-                            break
-                        j += 1
-                    
-                    if found_scroll_bounce:
-                        # Skip the entire block (don't add to output)
-                        i = j + 1
-                        print(f'removed scrollBounceBehavior block in {path}')
-                        continue
-                
-                out.append(lines[i])
-                i += 1
-            
-            if len(out) != len(lines):
-                open(path, 'w').writelines(out)
+        def patch_swift_file(path):
+            original = path.read_text()
+            patched, scroll_count = SCROLL_RE.subn(SCROLL_HELPER, original)
+            patched, onchange_new_value_count = ONCHANGE_NEW_VALUE_RE.subn(
+                r'.onChange(of: \1) { \2 in', patched
+            )
+            patched, onchange_unused_count = ONCHANGE_UNUSED_RE.subn(
+                r'.onChange(of: \1) { _ in', patched
+            )
 
-        # Apply all patches to all Swift files
-        for d in ['Strand', 'StrandiOS', 'StrandiOSShared', 'StrandiOSWidgets']:
-            if not os.path.exists(d):
-                continue
-            for root, _, files in os.walk(d):
-                for f in files:
-                    if f.endswith('.swift'):
-                        path = os.path.join(root, f)
-                        fix_timer(path)
-                        fix_onchange(path)
-                        fix_scroll_bounce_blocks(path)
+            if patched != original:
+                path.write_text(patched)
 
-        print('All patches applied')
+            return scroll_count, onchange_new_value_count + onchange_unused_count
+
+        def validate_no_unpatched_scroll_bounce():
+            leftovers = []
+            for path in swift_files():
+                for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+                    if '.scrollBounceBehavior(' in line:
+                        leftovers.append(f'{path}:{line_no}: {line.strip()}')
+            if leftovers:
+                print('Unpatched iOS 16.4 scrollBounceBehavior calls remain:')
+                print('\n'.join(leftovers[:50]))
+                raise SystemExit(1)
+
+        total_scroll = 0
+        total_onchange = 0
+        touched = []
+
+        for path in swift_files():
+            scroll_count, onchange_count = patch_swift_file(path)
+            if scroll_count or onchange_count:
+                touched.append(f'{path} (scrollBounceBehavior={scroll_count}, onChange={onchange_count})')
+                total_scroll += scroll_count
+                total_onchange += onchange_count
+
+        compat_changed = write_if_changed(COMPAT_PATH, COMPAT_SOURCE)
+        validate_no_unpatched_scroll_bounce()
+
+        print('iOS 16.3 compatibility patches applied')
+        print(f'  scrollBounceBehavior replacements: {total_scroll}')
+        print(f'  onChange compatibility rewrites: {total_onchange}')
+        print(f'  compatibility helper: {COMPAT_PATH} {"written" if compat_changed else "already current"}')
+        for entry in touched:
+            print(f'  patched {entry}')
         PYEOF
 
     - name: Generate Xcode project
@@ -146,3 +200,15 @@ jobs:
         draft: false
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Send success email
+      uses: dawidd6/action-send-mail@v18
+      with:
+        server_address: ${{ secrets.MAIL_SERVER }}
+        server_port: ${{ secrets.MAIL_PORT }}
+        username: ${{ secrets.MAIL_USERNAME }}
+        password: ${{ secrets.MAIL_PASSWORD }}
+        subject: ${{ steps.release_meta.outputs.subject }}
+        to: trejospeed@gmail.com
+        from: ${{ secrets.MAIL_FROM }}
+        body: ${{ steps.release_meta.outputs.body }}
