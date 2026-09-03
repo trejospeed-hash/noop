@@ -1,0 +1,11 @@
+# Ver qué archivos tienen conflictos
+git status
+
+# Editar los archivos en conflicto
+nano archivo-en-conflicto.yml
+
+# Marcar como resuelto
+git add archivo-en-conflicto.yml
+
+# Continuar el rebase
+git rebase --continue
