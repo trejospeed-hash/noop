@@ -110,9 +110,13 @@ jobs:
         path: NOOP_iOS16_TrollStore.ipa
         retention-days: 90
 
-    - name: Create Release
-      if: startsWith(github.ref, 'refs/tags/')
+    - name: Update latest-ios16 release
       uses: softprops/action-gh-release@v2
       with:
+        tag_name: latest-ios16
+        name: "NOOP iOS 16.3 (auto-actualizada)"
         files: NOOP_iOS16_TrollStore.ipa
-        name: "NOOP iOS 16.3 - ${{ github.ref_name }}"
+        prerelease: false
+        draft: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
