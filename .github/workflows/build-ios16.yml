@@ -60,17 +60,18 @@ jobs:
                 print('patched onChange in', path)
 
         def fix_scroll_bounce(path):
-            """Remove .scrollBounceBehavior calls (iOS 16.4+)"""
+            """Remove .scrollBounceBehavior modifier while preserving SwiftUI chain structure"""
             if not os.path.exists(path):
                 return
             with open(path, 'r') as f:
-                lines = f.readlines()
+                content = f.read()
             
-            filtered = [l for l in lines if '.scrollBounceBehavior(' not in l]
+            # Remove .scrollBounceBehavior(...) including leading whitespace
+            new_content = re.sub(r'\s*\.scrollBounceBehavior\([^)]*\)', '', content)
             
-            if len(filtered) != len(lines):
+            if new_content != content:
                 with open(path, 'w') as f:
-                    f.writelines(filtered)
+                    f.write(new_content)
                 print('patched scrollBounceBehavior in', path)
 
         # Apply all patches to all Swift files
