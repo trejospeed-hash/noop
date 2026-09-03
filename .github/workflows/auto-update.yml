@@ -1,4 +1,63 @@
-name: Auto update and build iOS 16.3
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      new_commits: ${{ steps.sync.outputs.new_commits }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Configure git
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+    
+    - name: Add upstream remote
+      run: |
+        # Remove upstream if it already exists to avoid "remote already exists" error
+        git remote remove upstream 2>/dev/null || true
+        git remote add upstream https://github.com/ryanbr/noop.git
+        echo "Upstream remote configured"
+    
+    - name: Fetch upstream
+      run: |
+        echo "Fetching from upstream..."
+        git fetch upstream main
+        echo "Fetch successful"
+    
+    - name: Count new commits
+      id: sync
+      run: |
+        COUNT=$(git rev-list HEAD..upstream/main --count)
+        echo "new_commits=$COUNT" >> "$GITHUB_OUTPUT"
+        echo "New commits found: $COUNT"
+    
+    - name: Merge upstream changes
+      if: steps.sync.outputs.new_commits != '0'
+      run: |
+        echo "Merging upstream/main into main..."
+        # Use rebase instead of merge to keep history cleaner
+        # If there are conflicts, this will fail and we'll handle it
+        if git merge upstream/main --no-edit -m "Merge upstream changes (auto-sync)"; then
+          echo "Merge successful"
+        else
+          echo "::error::Merge failed due to conflicts"
+          echo "Attempting merge with -X theirs strategy..."
+          git merge --abort
+          git merge upstream/main -X theirs --no-edit -m "Merge upstream changes (auto-sync, theirs strategy)"
+          echo "Merge successful with theirs strategy"
+        fi
+    
+    - name: Push to main
+      if: steps.sync.outputs.new_commits != '0'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        echo "Pushing changes to origin..."
+        git push origin main
+        echo "Push successful"name: Auto update and build iOS 16.3
 
 on:
   schedule:
