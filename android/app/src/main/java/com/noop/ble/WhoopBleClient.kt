@@ -26,6 +26,7 @@ import android.os.SystemClock
 import android.util.Log
 import com.noop.NoopApplication
 import com.noop.data.HrRow
+import com.noop.data.InsertCounts
 import com.noop.data.RrRow
 import com.noop.data.EventEntry
 import com.noop.data.StandardHrMapping
@@ -1080,6 +1081,17 @@ class WhoopBleClient(
         /** Stream gone quiet this long (but not yet stall) ⇒ re-subscribe in case a CCCD silently dropped. */
         private const val KEEPALIVE_QUIET_MS = 45_000L
 
+        /**
+         * #1865: how long live HR may be absent, while we believe the stream is armed, before a 5/MG gets
+         * one re-arm.
+         *
+         * Sits between the 45 s quiet threshold and the 600 s bounce fuse on purpose. The 0x2A37 profile
+         * genuinely lulls at rest — that lull is why #1414 widened the fuse to 10 minutes — so a shorter
+         * value would re-arm a perfectly healthy stream, while waiting for the fuse means never recovering
+         * at all: the fuse watches ANY inbound data, and a strap answering battery polls never trips it.
+         */
+        private const val REALTIME_HR_STALL_MS = 300_000L
+
         /** A CCCD write can transiently return BUSY if the stack slot hasn't freed yet; retry the same
          *  subscribe a few times (short backoff) before giving up, rather than dropping the stream. */
         private const val CCCD_RETRY_DELAY_MS = 60L
@@ -1238,6 +1250,28 @@ class WhoopBleClient(
             201 -> "status=ERROR_GATT_WRITE_REQUEST_BUSY(201)"
             else -> "status=$status"
         }
+
+        /**
+         * #1865: whether a 5/MG's realtime stream looks LAPSED and should get its one re-arm.
+         *
+         * Pure so the decision is testable — `keepAliveFire` itself needs a live GATT link, which is why
+         * the drop-recovery decision next door was extracted the same way.
+         *
+         * Every clause earns its place:
+         *  - `wantsRealtime`: never arm a stream nobody asked for.
+         *  - `realtimeArmed`: if we do NOT believe it is armed, `reconcileRealtime` has a real edge and
+         *    sends the toggle itself. This path exists only for the case it cannot see.
+         *  - `!reArmedSinceHr`: one write per stall episode, not one per 30 s tick.
+         *  - the threshold: the 0x2A37 profile legitimately lulls at rest, so this must sit well past a
+         *    normal quiet spell.
+         */
+        fun shouldReArmLapsedRealtime(
+            wantsRealtime: Boolean,
+            realtimeArmed: Boolean,
+            reArmedSinceHr: Boolean,
+            hrSilentMs: Long,
+            stallMs: Long = REALTIME_HR_STALL_MS,
+        ): Boolean = wantsRealtime && realtimeArmed && !reArmedSinceHr && hrSilentMs > stallMs
 
         fun shouldReArmRealtimeAfterDrop(droppedCmd: CommandNumber?): Boolean =
             droppedCmd == CommandNumber.TOGGLE_REALTIME_HR
@@ -2812,6 +2846,7 @@ class WhoopBleClient(
         deviceId = deviceId,
         cursorStore = cursorStore,
         ackTrim = { trim, endData -> ackHistoricalChunk(trim, endData) },
+        onBankedOffload = { counts -> addBankedOffload(counts) },
         onChunkCommitted = { batch -> onBackfillChunkCommitted(batch) },
         onConsoleChunk = { consoleChunksThisSession += 1 },
         // #77/#91: archive undecodable frames before the ack. append() returns ok=true (written, or
@@ -3269,6 +3304,21 @@ class WhoopBleClient(
     @Volatile private var realtimeArmed = false
     /** Wall-clock of the last inbound notification — drives the keep-alive liveness watchdog. */
     @Volatile private var lastDataAtMs = 0L
+
+    /**
+     * #1865: when a LIVE HR sample last arrived — distinct from [lastDataAtMs], which any inbound frame
+     * refreshes.
+     *
+     * That distinction is the whole bug. A 5/MG whose realtime stream has lapsed still answers battery
+     * polls and still serves history, so [lastDataAtMs] keeps the link looking perfectly healthy and the
+     * stall bounce never fires. Only an HR-specific clock can see "the stream is dead while the link is
+     * fine", which is exactly the state reported: bonded, worn, history synced just now, no bpm.
+     */
+    @Volatile private var lastLiveHrAtMs = 0L
+
+    /** #1865: one re-arm per stall episode, cleared when live HR resumes. Same shape as
+     *  [resubscribedSinceData] — recovering costs one write, repeating it every tick would not. */
+    @Volatile private var realtimeReArmedSinceHr = false
     /** True once we've re-subscribed during the CURRENT quiet episode, so the keep-alive re-subscribes
      *  at most once between data arrivals instead of flooding descriptor writes every 30s tick (#77).
      *  Reset to false in [onInbound] when fresh data lands. */
@@ -4864,13 +4914,17 @@ class WhoopBleClient(
      * here.
      */
     @SuppressLint("MissingPermission")
+    /** #1867: the latched per-device refusal, read the same way by the probe and by the handshake skip
+     *  that serves it — two readers of one fact, so neither can drift from the other. */
+    private fun unbondedOffloadPreviouslyRefused(address: String?): Boolean = runCatching {
+        unbondedOffloadRefusedPrefKey(address)?.let {
+            context.getSharedPreferences(com.noop.ui.NoopPrefs.NAME, android.content.Context.MODE_PRIVATE)
+                .getBoolean(it, false)
+        } ?: false
+    }.getOrDefault(false)
+
     private fun beginUnbondedOffloadProbe(g: BluetoothGatt) {
-        val refused = runCatching {
-            unbondedOffloadRefusedPrefKey(g.device.address)?.let {
-                context.getSharedPreferences(com.noop.ui.NoopPrefs.NAME, android.content.Context.MODE_PRIVATE)
-                    .getBoolean(it, false)
-            } ?: false
-        }.getOrDefault(false)
+        val refused = unbondedOffloadPreviouslyRefused(g.device.address)
         if (!shouldProbeUnbondedOffload(
                 isWhoop5 = connectedFamily == DeviceFamily.WHOOP5,
                 optedIn = PuffinExperiment.from(context).unbondedOffload,
@@ -6145,6 +6199,12 @@ class WhoopBleClient(
                     // #1809: this link's inbound tally starts empty, so the epitaph on disconnect reports
                     // exactly what arrived on THIS link and never a previous session's traffic.
                     inboundFrames = 0; inboundBytes = 0; cmdChannelFrames = 0
+                    // #1635: same guarantee for the banked tally. Clearing only on teardown would be enough if
+                    // every link ended in one; a link that begins without a preceding clean teardown would
+                    // otherwise open holding the previous link's rows and report them as banked on this one.
+                    liveHr.set(0); liveRr.set(0); offloadHr.set(0); offloadRr.set(0)
+                    offloadGravity.set(0); offloadResp.set(0); offloadSkinTemp.set(0)
+                    offloadSpo2.set(0); offloadSteps.set(0); offloadChunks.set(0)
                     realtimeArmedThisLink = false
                     // A connect succeeded → clear the stale-bond re-pair guide UNLESS we are in a known
                     // bond-loop (#617). In that loop the strap "connects" every ~3 s before timing out
@@ -6672,6 +6732,40 @@ class WhoopBleClient(
     private var inboundFrames = 0
     private var inboundBytes = 0
     private var cmdChannelFrames = 0
+
+    // #1635: rows ACCEPTED on this link, split by PATH. The realtime decoder (`extractStreams`) only
+    // ever produces hr/rr/events/battery; gravity, resp, skinTemp, spo2 and steps arrive solely through
+    // the offload's historical decoder. Counting one path and naming streams from the other printed a
+    // constant dressed as a finding, which is what the live-only first cut did.
+    //
+    // ATOMIC because the writers are not one thread: the live pair is folded in from `flushLive` and
+    // `flushStandardHr`, two independent `ioScope.launch` coroutines, the offload pair from the
+    // Backfiller's own coroutine, and the teardown read is a third context again.
+    private val liveHr = java.util.concurrent.atomic.AtomicInteger(0)
+    private val liveRr = java.util.concurrent.atomic.AtomicInteger(0)
+    private val offloadHr = java.util.concurrent.atomic.AtomicInteger(0)
+    private val offloadRr = java.util.concurrent.atomic.AtomicInteger(0)
+    private val offloadGravity = java.util.concurrent.atomic.AtomicInteger(0)
+    private val offloadResp = java.util.concurrent.atomic.AtomicInteger(0)
+    private val offloadSkinTemp = java.util.concurrent.atomic.AtomicInteger(0)
+    private val offloadSpo2 = java.util.concurrent.atomic.AtomicInteger(0)
+    private val offloadSteps = java.util.concurrent.atomic.AtomicInteger(0)
+    /** Chunks the offload actually persisted on this link. Separates "never ran" from "nothing new". */
+    private val offloadChunks = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /** Fold one LIVE persist round into the per-link tally (hr/rr are all the realtime decoder yields). */
+    private fun addBankedLive(c: InsertCounts) {
+        liveHr.addAndGet(c.hr); liveRr.addAndGet(c.rr)
+    }
+
+    /** Fold one OFFLOAD persist round in. This is where the bond shows: an unbonded strap defers it. */
+    private fun addBankedOffload(c: InsertCounts) {
+        offloadChunks.incrementAndGet()
+        offloadHr.addAndGet(c.hr); offloadRr.addAndGet(c.rr)
+        offloadGravity.addAndGet(c.gravity); offloadResp.addAndGet(c.resp)
+        offloadSkinTemp.addAndGet(c.skinTemp); offloadSpo2.addAndGet(c.spo2)
+        offloadSteps.addAndGet(c.steps)
+    }
     /** #1809: was realtime armed at ANY point on THIS link. Not the same thing as [realtimeArmed], which
      *  is persistent edge state: it can carry true in from a previous link, or read false at the drop
      *  after a mid-link disarm. The epitaph needs the per-link fact, which is what the Apple twin's
@@ -7106,6 +7200,12 @@ class WhoopBleClient(
                     // Only republish when the value actually changed: a same-HR frame's it.copy() allocates a
                     // whole throwaway LiveState that StateFlow drops as equal anyway — pure GC churn at ~1 Hz,
                     // every frame. Matches the Swift FrameRouter guard (`state.heartRate != hr`).
+                    // #1865: only a LIVE sample restarts the stall clock. Replayed offload frames reach
+                    // this branch too (handleFrame carries `replayedOffload`, and stopUnexpectedRealtimeImu
+                    // gates on it for exactly that reason), so counting them would let a history sync mask
+                    // a dead realtime stream — which is the very shape of the bug this recovers from:
+                    // healthy-looking traffic hiding the absence of HR.
+                    if (hr in 30..220 && !replayedOffload) noteLiveHr()
                     if (hr in 30..220 && _state.value.heartRate != hr) _state.update { it.copy(heartRate = hr) }
                 }
                 // The realtime stream usually reports rr_count=0; only update R-R when this frame
@@ -7538,6 +7638,7 @@ class WhoopBleClient(
             // Skip the redundant it.copy() when HR is unchanged — StateFlow drops an equal state anyway, so
             // this only avoids the per-frame throwaway LiveState allocation (matches FrameRouter). The bonded
             // transition below stays UNCONDITIONAL: it must still fire once even while HR sits steady.
+            noteLiveHr()
             if (_state.value.heartRate != hr) _state.update { it.copy(heartRate = hr) }
             // EXPERIMENTAL WHOOP 5.0/MG: there is no confirmed-write bond for a 5/MG strap, so once
             // live HR actually streams over the standard profile we treat the link as established —
@@ -7632,6 +7733,12 @@ class WhoopBleClient(
     // MARK: Live-stream keep-alive  (port of BLEManager.startKeepAlive / keepAliveFire)
     // ====================================================================================
 
+    /** #1865: a live HR sample arrived — restart the stall clock and re-arm the one-shot recovery. */
+    private fun noteLiveHr() {
+        lastLiveHrAtMs = System.currentTimeMillis()
+        realtimeReArmedSinceHr = false
+    }
+
     /**
      * How long this family's live link may go silent before the app stops calling it healthy.
      *
@@ -7639,6 +7746,9 @@ class WhoopBleClient(
      * says "a reconnect would achieve nothing", and the only honest measure of that is the same one the
      * watchdog uses to decide a reconnect IS needed. Two numbers here could disagree, and the way they
      * would fail is a Connect button that declines to act on a link the watchdog has already given up on.
+     *
+     * Note it measures ANY inbound data, not live HR — which is why #1865 needed its own clock: a strap
+     * answering battery polls keeps this fuse from ever tripping while the HR stream is dead.
      */
     private fun liveLinkStallFuseMs(): Long =
         if (connectedFamily == DeviceFamily.WHOOP5) KEEPALIVE_STALL_5MG_EMPTY_MS else KEEPALIVE_STALL_MS
@@ -7648,6 +7758,10 @@ class WhoopBleClient(
         handler.removeCallbacks(keepAliveRunnable)
         keepAliveTick = 0
         lastDataAtMs = System.currentTimeMillis()   // arm the watchdog from "now", not 1970
+        // #1865: same reasoning for the HR clock — a fresh link has not missed anything yet, so the stall
+        // check must not fire on the first tick just because no sample has landed in the first 30 seconds.
+        lastLiveHrAtMs = System.currentTimeMillis()
+        realtimeReArmedSinceHr = false
         handler.postDelayed(keepAliveRunnable, KEEPALIVE_INTERVAL_MS)
     }
 
@@ -7738,14 +7852,44 @@ class WhoopBleClient(
                     if (wantsRealtime) { realtimeArmed = true; realtimeArmedThisLink = true; send(CommandNumber.TOGGLE_REALTIME_HR, byteArrayOf(1)) }
                     // #battery: ~60 s normally, ~30 s while charging (see [batteryPollDue]).
                     if (batteryPollDue(keepAliveTick, s.charging == true)) send(CommandNumber.GET_BATTERY_LEVEL)
-                } else if (connectedFamily == DeviceFamily.WHOOP5 &&
-                    batteryPollDue(keepAliveTick, s.charging == true)
-                ) {
+                } else if (connectedFamily == DeviceFamily.WHOOP5) {
+                    // #1865: re-arm a LAPSED realtime stream. The WHOOP4 branch above re-sends
+                    // TOGGLE_REALTIME_HR every tick precisely because "the firmware lets the realtime HR
+                    // stream lapse if it isn't re-armed" — a 5/MG got none of that, on the reasoning that it
+                    // "rejects WHOOP4-framed commands". That premise no longer holds for this command:
+                    // `reconcileRealtime` above sends the toggle to BOTH families because send() routes the
+                    // 5/MG one with puffin framing.
+                    //
+                    // Nothing else recovers it. reconcileRealtime is edge-triggered, so while we believe the
+                    // stream is armed it sends nothing; the one-shot re-subscribe fixes a dropped CCCD, not a
+                    // lapsed stream; and the stall bounce keys on [lastDataAtMs], which battery polls and
+                    // history offload keep fresh. Reported exactly that way: bonded, worn, "history synced
+                    // just now", and no bpm — every other signal healthy, which is what kept the one path
+                    // that could have helped from firing.
+                    //
+                    // Gated on an HR-SPECIFIC stall rather than sent every tick: a healthy 5/MG stream costs
+                    // nothing, and the 0x2A37 profile legitimately lulls at rest (why #1414 widened the bounce
+                    // fuse to 10 min), so the threshold sits well past a normal lull. One re-arm per stall
+                    // episode, cleared when a sample lands.
+                    val hrSilentMs = System.currentTimeMillis() - lastLiveHrAtMs
+                    if (shouldReArmLapsedRealtime(
+                            wantsRealtime = wantsRealtime,
+                            realtimeArmed = realtimeArmed,
+                            reArmedSinceHr = realtimeReArmedSinceHr,
+                            hrSilentMs = hrSilentMs,
+                        )
+                    ) {
+                        realtimeReArmedSinceHr = true
+                        log("No live HR for ${hrSilentMs / 1000}s while armed — re-arming the 5/MG realtime stream (#1865)")
+                        send(CommandNumber.TOGGLE_REALTIME_HR, byteArrayOf(1))
+                    }
+                    if (batteryPollDue(keepAliveTick, s.charging == true)) {
                     // 5/MG battery comes only from a 0x2A19 read and the strap sends no unsolicited battery
                     // notification, so poll it here (about every 60s) rather than only while the Live screen
                     // is open. The ring then stays current on any screen without a manual sync, and the read
                     // keeps the link warm.
-                    refreshBattery()
+                        refreshBattery()
+                    }
                 }
             }
         }
@@ -8535,6 +8679,14 @@ class WhoopBleClient(
                         isWhoop5 = true,
                         appLevelBonded = didBond,
                         userInitiated = helloRetryRequested,
+                        // Same retirement the probe applies to itself — read here rather than assumed, so
+                        // the skip stops the moment the thing it serves does. The two inputs address the
+                        // same strap: `lastDevice` is set at connect, long before this runs post-discovery,
+                        // and `beginUnbondedOffloadProbe` already pairs these two sources the same way.
+                        probeRetired = unbondedProbeRetired(
+                            previouslyRefused = unbondedOffloadPreviouslyRefused(g.device.address),
+                            silentLinksSoFar = unbondedProbeSilentLinks,
+                        ),
                     )
                 ) {
                     log(unbondedProbeSupersedesLine(explicitBondOptedIn = puffinExperiment.explicitBond))
@@ -8941,7 +9093,7 @@ class WhoopBleClient(
         }
         if (!batch.isEmpty) {
             try {
-                repository.insert(batch, deviceId)
+                addBankedLive(repository.insert(batch, deviceId))
                 liveInsertFailuresRealtime.set(0)
             } catch (t: Throwable) {
                 // Re-buffer at the front so these frames retry on the next cadence (port of Collector).
@@ -9024,7 +9176,7 @@ class WhoopBleClient(
             }
         }
         try {
-            repository.insert(StreamBatch(hr = hr, rr = rr, events = contact), deviceId)
+            addBankedLive(repository.insert(StreamBatch(hr = hr, rr = rr, events = contact), deviceId))
             liveInsertFailuresStd.set(0)
         } catch (t: Throwable) {
             synchronized(collectorLock) {
@@ -9876,9 +10028,26 @@ class WhoopBleClient(
                 // before handleDisconnect runs and is not reassigned above, so it is valid here.
                 ended = if (intentionalDisconnect) "intentional" else "status=$status",
             ))
+            // #1635: what the DATABASE gained from the LIVE streams, beside what the radio carried. An
+            // unbonded 5/MG keeps the epitaph looking healthy — hundreds of inbound frames — while every
+            // bond-gated stream banks nothing, and that split is invisible in a single export. Live only:
+            // the offload persists through `Backfiller` and has its own accounting, so folding it in here
+            // would be double-counted in one direction and, worse, its ABSENCE reads as a fault.
+            // Guarded by the SAME `linkUpSinceMs` as the epitaph: on a failed connect attempt the counters
+            // hold the previous link's tally, and reporting them would describe a link that never existed.
+            log(ConnectionReadout.linkBankedSummary(
+                liveHr = liveHr.get(), liveRr = liveRr.get(), offloadChunks = offloadChunks.get(),
+                offloadHr = offloadHr.get(), offloadRr = offloadRr.get(),
+                offloadGravity = offloadGravity.get(), offloadResp = offloadResp.get(),
+                offloadSkinTemp = offloadSkinTemp.get(), offloadSpo2 = offloadSpo2.get(),
+                offloadSteps = offloadSteps.get(),
+            ), com.noop.testcentre.TestDomain.CONNECTION)
         }
         // Clear the tally with the link, so a second teardown for the same drop cannot re-report it.
         inboundFrames = 0; inboundBytes = 0; cmdChannelFrames = 0
+        liveHr.set(0); liveRr.set(0); offloadHr.set(0); offloadRr.set(0)
+        offloadGravity.set(0); offloadResp.set(0); offloadSkinTemp.set(0)
+        offloadSpo2.set(0); offloadSteps.set(0); offloadChunks.set(0)
 
         val heldSuffix = heldForLogSuffix()
         linkUpSinceMs = null
