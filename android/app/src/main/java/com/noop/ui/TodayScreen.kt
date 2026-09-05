@@ -144,12 +144,15 @@ import android.view.HapticFeedbackConstants
 import android.widget.Toast
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.noop.R
+import com.noop.ai.AiKeyStore
 import com.noop.analytics.Baselines
 import com.noop.analytics.BatteryEstimator
 import com.noop.analytics.ChargeDriver
 import com.noop.analytics.ChargeDriverLabel
 import com.noop.analytics.ChargeDriverUnit
 import com.noop.analytics.ChargeDriverVerdict
+import com.noop.analytics.DayCycleMode
+import com.noop.analytics.DayCycleIntelligenceIntegration
 import com.noop.analytics.HydrationGoal
 import com.noop.analytics.HydrationStore
 import com.noop.analytics.ReadinessEngine
@@ -293,6 +296,8 @@ fun TodayScreen(
     // Optional Coupled view card (task #43): a tap-through to the WHOOP-style day screen. Defaulted to a
     // no-op so the call site stays compiling; AppRoot binds it to nav.navigate(CoupledView).
     onOpenCoupled: () -> Unit = {},
+    /** #1862: open Coach, optionally with a question the Today launcher already collected. */
+    onOpenCoach: (String?) -> Unit = {},
     // The "workout in progress" indicator card routes to Live and re-opens the in-exercise overlay. Defaulted
     // to a no-op so the call site stays compiling; AppRoot binds it to openActiveWorkout() + nav.navigate(Live).
     onOpenActiveWorkout: () -> Unit = {},
@@ -306,6 +311,7 @@ fun TodayScreen(
     val today by viewModel.today.collectAsStateWithLifecycle()
     val alert by viewModel.healthAlert.collectAsStateWithLifecycle()
     val days by viewModel.recentDays.collectAsStateWithLifecycle()
+    val activeDayCycle by viewModel.activeDayCycle.collectAsStateWithLifecycle()
     val spo2CandidateByDay by viewModel.spo2CandidateByDay.collectAsStateWithLifecycle()
     val v5Signals by viewModel.v5Signals.collectAsStateWithLifecycle()
     val cycleEnabled by viewModel.cycleTrackingEnabled.collectAsStateWithLifecycle()
@@ -392,6 +398,17 @@ fun TodayScreen(
     val historicalMetric = remember(days, selectedDayKey) { days.lastOrNull { it.day == selectedDayKey } }
     val displayMetric = remember(today, historicalMetric, selectedDayOffset) {
         if (selectedDayOffset == 0) today ?: historicalMetric else historicalMetric
+    }
+    val dayCycleMode = NoopPrefs.dayCycleMode(LocalContext.current)
+    // Steps alone use the physiological sleep-onset cycle. Every other field stays on the dashboard's
+    // existing logical-day row; past-day navigation continues to show the persisted historical cycle row.
+    val stepResolvedDisplayMetric = remember(displayMetric, activeDayCycle, selectedDayOffset, dayCycleMode) {
+        val cycleSteps = activeDayCycle?.steps
+        if (selectedDayOffset == 0 && dayCycleMode == DayCycleMode.SLEEP_ONSET && cycleSteps != null) {
+            displayMetric?.copy(steps = cycleSteps)
+        } else {
+            displayMetric
+        }
     }
     // Keep the explicit calendar date visible alongside Today/Yesterday so the logical-day remap stays
     // honest, between midnight and 04:00 "Today" still points at the prior calendar date, and showing
@@ -920,11 +937,15 @@ fun TodayScreen(
     // fabricated number. Any past day → null (the gauge uses the stored strain). Keyed on the same inputs
     // as the day-scoped loads so it reloads as the selector moves and as a sync/import grows the HR window.
     var liveTodayStrain by remember { mutableStateOf<Double?>(null) }
-    LaunchedEffect(days, selectedDayKey, selectedDayOffset) {
+    LaunchedEffect(days, selectedDayKey, selectedDayOffset, activeDayCycle, dayCycleMode) {
         liveTodayStrain = if (selectedDayOffset == 0) {
             val zone = ZoneId.systemDefault()
-            val start = selectedDay.atStartOfDay(zone).toEpochSecond()
             val now = System.currentTimeMillis() / 1000
+            val start = activeDayCycleStart(
+                mode = dayCycleMode,
+                confirmedOrSyntheticOnset = activeDayCycle?.onsetTs,
+                calendarStart = selectedDay.atStartOfDay(zone).toEpochSecond(),
+            )
             // #908: read the active strap ∪ canonical "my-whoop" union, NOT a hardcoded "my-whoop". A strap
             // re-added through the device manager banks its live HR under its own fresh id, so a pinned
             // "my-whoop" read returned nothing and Effort integrated to 0 off an empty series. Single-WHOOP
@@ -934,10 +955,11 @@ fun TodayScreen(
             // effMaxHR resolution matches AnalyticsEngine: manual HR-max override first, else Tanaka from age.
             val effMaxHR = profileStore.hrMaxOverride.takeIf { it > 0 }?.toDouble()
                 ?: if (profileStore.age > 0) StrainScorer.tanakaHRmax(profileStore.age.toDouble()) else null
+            val restingHr = displayMetric?.restingHr?.toDouble() ?: StrainScorer.defaultRestingHR
             StrainScorer.strain(
                 hr = todayHr,
                 maxHR = effMaxHR,
-                restingHR = displayMetric?.restingHr?.toDouble() ?: StrainScorer.defaultRestingHR,
+                restingHR = restingHr,
                 method = NoopPrefs.effortMethod(context),
                 sex = profileStore.sex,
             )
@@ -1563,7 +1585,7 @@ fun TodayScreen(
                             }
                             Box(modifier = Modifier.fillMaxWidth().staggeredAppear(stagger)) {
                                 MetricGrid(
-                                    d = displayMetric,
+                                    d = stepResolvedDisplayMetric,
                                     w = window,
                                     recoveryCalibration = recoveryCalibration,
                                     lastScoredCharge = lastScoredCharge,
@@ -1579,7 +1601,7 @@ fun TodayScreen(
                                     profileWeightKg = profileWeightKg,
                                     importedStepsForDay = importedStepsForDay,
                                     estimatedStepsForDay = stepsEstForDay,
-                                    caloriesForDay = caloriesByDay[selectedDayKey],   // #616: imported-first per day
+                                    caloriesForDay = caloriesByDay[selectedDayKey],
                                     caloriesSpark = caloriesSpark,                    // #616: imported-first trend
                                     stepActivityClassForDay = stepActivityClassForDay,
                                     stepsEstimateCaption = stepsEstimateCaption(profileStore),
@@ -1612,7 +1634,8 @@ fun TodayScreen(
                             modifier = Modifier.fillMaxWidth().staggeredAppear(stagger),
                             verticalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
-                            HeartRateTrendCard(viewModel, days, selectedDay, todayDate, displayMetric, effortScale, effortForDay)
+                            HeartRateTrendCard(viewModel, days, selectedDay, todayDate, displayMetric,
+                                effortScale, effortForDay, dayCycleMode)
                         }
                         // The three hero vitals, HRV / Resting HR / Respiratory. Carried day (#543).
                         TodaySection.RECOVERY_VITALS -> Box(modifier = Modifier.fillMaxWidth().staggeredAppear(stagger)) {
@@ -1625,7 +1648,7 @@ fun TodayScreen(
                         // section emits no item; visibleDashboardCards is the loop-level filtered list.
                         TodaySection.YOUR_CARDS -> YourCardsSection(
                             cards = visibleDashboardCards,
-                            day = displayMetric,
+                            day = stepResolvedDisplayMetric,
                             carriedDay = lastScoredRecoveryDay,
                             vitalsDay = lastVitalsDay,
                             spo2Day = lastSpo2Day,
@@ -1647,6 +1670,7 @@ fun TodayScreen(
                             onOpenMetric = onOpenMetric,
                             onOpenSleep = onOpenSleep,
                             onOpenCoupled = onOpenCoupled,
+                            onOpenCoach = onOpenCoach,
                             onCustomise = { showDashboardEditor = true },
                             spo2CandidateByDay = spo2CandidateByDay,
                         )
@@ -3360,6 +3384,7 @@ private fun YourCardsSection(
     onOpenMetric: (String) -> Unit,
     onOpenSleep: () -> Unit,
     onOpenCoupled: () -> Unit,
+    onOpenCoach: (String?) -> Unit,
     onCustomise: () -> Unit,
     spo2CandidateByDay: Map<String, Double> = emptyMap(),
 ) {
@@ -3367,6 +3392,22 @@ private fun YourCardsSection(
     // Swift twin) do. The classic dashboard hardcoded Celsius here alone, so a °F user saw °C on this
     // screen only.
     val fahrenheit = UnitPrefs.temperature(LocalContext.current) == TemperatureUnit.FAHRENHEIT
+    // #1862: the optional Coach card opens a launcher BOTTOM SHEET rather than a destination. Local
+    // presentation state — showing it requests nothing from a provider.
+    var showCoachLauncher by remember { mutableStateOf(false) }
+    if (showCoachLauncher) {
+        val ctx = LocalContext.current
+        CoachLauncherSheet(
+            isConfigured = AiKeyStore.hasKey(ctx),
+            onPick = { prompt ->
+                showCoachLauncher = false
+                CoachHandoff.pendingPrompt = prompt
+                onOpenCoach(prompt)
+            },
+            onSetup = { showCoachLauncher = false; onOpenCoach(null) },
+            onDismiss = { showCoachLauncher = false },
+        )
+    }
     Box(modifier = Modifier.fillMaxWidth().staggeredAppear(2)) {
         Column(verticalArrangement = Arrangement.spacedBy(Metrics.gap)) {
             // Header: "YOUR CARDS" overline + a right-aligned blue EDIT action (the WHOOP ✎ affordance).
@@ -3435,6 +3476,7 @@ private fun YourCardsSection(
                         onOpenSleep = onOpenSleep,
                         onOpenHydration = onOpenHydration,
                         onOpenCoupled = onOpenCoupled,
+                        onOpenCoach = { showCoachLauncher = true },
                     ),
                 )
             }
@@ -3475,7 +3517,9 @@ private fun dashboardCardMetricKey(card: DashboardCard): String? = when (card) {
     DashboardCard.STEPS -> "steps_est"
     DashboardCard.CALORIES -> "active_kcal"
     // These carry their own full screen, not a per-metric trend.
-    DashboardCard.STRESS, DashboardCard.SLEEP, DashboardCard.HYDRATION, DashboardCard.COUPLED -> null
+    DashboardCard.STRESS, DashboardCard.SLEEP, DashboardCard.HYDRATION, DashboardCard.COUPLED,
+    // #1862: a launcher row, not a metric — no explorer key.
+    DashboardCard.COACH -> null
 }
 
 /** The destination callback a dashboard card opens when tapped. Mirrors the iOS dashboardCardRow switch:
@@ -3489,12 +3533,17 @@ private fun dashboardCardDestination(
     onOpenSleep: () -> Unit,
     onOpenHydration: () -> Unit,
     onOpenCoupled: () -> Unit,
+    // #1862: Coach is the one card that opens a SHEET rather than a destination, so its "destination" is
+    // a callback that shows the launcher. Kept in this same resolver so every card still resolves to
+    // exactly one tap action and the chevron stays honest.
+    onOpenCoach: () -> Unit,
 ): () -> Unit = when (card) {
     DashboardCard.STRESS -> onOpenStress
     DashboardCard.SLEEP -> onOpenSleep
     DashboardCard.HYDRATION -> onOpenHydration
     // The Coupled view card (#43) taps through to the full WHOOP-style day screen.
     DashboardCard.COUPLED -> onOpenCoupled
+    DashboardCard.COACH -> onOpenCoach
     // Every overnight vital + Fitness age / Vitality / Steps / Calories opens its own metric-detail trend.
     else -> {
         val key = dashboardCardMetricKey(card)
@@ -3525,6 +3574,7 @@ private fun dashboardCardTint(card: DashboardCard): Color = when (card) {
     DashboardCard.CALORIES -> Palette.metricAmber
     DashboardCard.HYDRATION -> Palette.metricCyan
     DashboardCard.COUPLED -> Palette.chargeColor
+    DashboardCard.COACH -> Palette.accent
 }
 
 /**
@@ -3571,6 +3621,7 @@ private fun dashboardCardFraction(
         }
         DashboardCard.SLEEP -> over(vd?.totalSleepMin, 480.0)
         DashboardCard.COUPLED -> 0.6
+        DashboardCard.COACH -> 0.5
         // Not wired to a real read yet — an EMPTY vessel (not half-full) so it doesn't imply a reading.
         DashboardCard.BLOOD_OXYGEN, DashboardCard.SKIN_TEMP, DashboardCard.CALORIES,
         DashboardCard.HYDRATION -> null
@@ -3695,6 +3746,10 @@ private fun dashboardCardValue(
         DashboardCard.COUPLED ->
             // A tap-through row with no metric value of its own, the row shows just the chevron. An empty
             // string (not NO_DATA) renders no number and leaves it un-dimmed. Mirrors iOS dashboardValue.
+            ""
+        DashboardCard.COACH ->
+            // #1862: likewise a launcher row. Empty rather than NO_DATA for the same reason — there is no
+            // missing measurement here, there is no measurement at all.
             ""
     }
 }
@@ -5547,6 +5602,7 @@ private fun HeartRateTrendCard(
     // #1001: the day's resolved Effort for the chart's edge badge. It read `displayMetric.strain` — the
     // daily row — so on an active morning the badge trailed the hero ring by the whole morning's load.
     effortForDay: Double? = null,
+    dayCycleMode: DayCycleMode = DayCycleMode.SLEEP_ONSET,
 ) {
     // "Today" here is the LOGICAL day (rolls at 04:00 local), so in the small hours after midnight the
     // trend keeps the evening's curve, window start at the logical day's own midnight, "since midnight"
@@ -5582,12 +5638,22 @@ private fun HeartRateTrendCard(
     val live by viewModel.live.collectAsStateWithLifecycle()
     // Re-load when the day list changes (an import updates it), when the day selector moves, and, via the
     // sync tokens, when a strap offload banks fresh HR samples for the current window. Also on first compose.
-    LaunchedEffect(days, selectedDay, today, live.lastSyncAt, live.syncChunksThisSession) {
+    LaunchedEffect(days, selectedDay, today, live.lastSyncAt, live.syncChunksThisSession, dayCycleMode) {
         val zone = ZoneId.systemDefault()
-        val start = selectedDay.atStartOfDay(zone).toEpochSecond()
+        val calendarStart = selectedDay.atStartOfDay(zone).toEpochSecond()
         val nextStart = selectedDay.plusDays(1).atStartOfDay(zone).toEpochSecond()
         val now = System.currentTimeMillis() / 1000
-        val end = if (selectedDay == today) now else (nextStart - 1)
+        val calendarEnd = if (selectedDay == today) now else (nextStart - 1)
+        val markerRows = if (dayCycleMode == DayCycleMode.SLEEP_ONSET) runCatching {
+            viewModel.repo.metricSeriesComputedUnion(
+                viewModel.activeStrapId, DayCycleIntelligenceIntegration.ONSET_KEY,
+                selectedDay.toString(), selectedDay.plusDays(1).toString(),
+            )
+        }.getOrDefault(emptyList()) else emptyList()
+        val start = markerRows.firstOrNull { it.day == selectedDay.toString() }?.value?.toLong()
+            ?: calendarStart
+        val end = markerRows.firstOrNull { it.day == selectedDay.plusDays(1).toString() }?.value?.toLong()
+            ?.minus(1L) ?: calendarEnd
         // #908: the Today HR curve reads the active strap ∪ canonical "my-whoop" union, NOT a hardcoded
         // "my-whoop". A strap re-added via the device manager banks live HR under its own fresh id, so a
         // pinned read showed the "no heart rate banked yet today" empty state. Single-WHOOP ⇒ one id ⇒ same.

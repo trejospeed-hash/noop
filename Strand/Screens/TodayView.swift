@@ -187,6 +187,8 @@ struct ActiveWorkoutIndicatorSection: View {
 }
 
 struct TodayView: View {
+    @AppStorage(DayCycleMode.storageKey) private var dayCycleModeRaw = DayCycleMode.sleepOnset.rawValue
+    private var dayCycleMode: DayCycleMode { DayCycleMode.persisted(dayCycleModeRaw) }
     /// Product mark, never natural-language copy. Keeping it out of localization also makes source
     /// classification and tint selection stable when the app language changes.
     private static let whoopBrandName = "WHOOP"
@@ -401,6 +403,9 @@ struct TodayView: View {
     @State private var showSettings = false
     @State private var showLiveSession = false
     /// The Updates inbox sheet (opened by the header bell). Shared across both platforms.
+    /// #1862: the optional Coach launcher sheet, opened from the default-OFF Coach dashboard card.
+    /// Presentation state only — nothing is requested from a provider by opening it.
+    @State private var showCoachLauncher = false
     @State private var showUpdatesInbox = false
 
     /// The NEWEST day-key (max yyyy-MM-dd in `repo.days`) announced to the inbox. Persisted (not @State)
@@ -1479,7 +1484,8 @@ struct TodayView: View {
         }
         // Reload when the data refreshes OR the selected day changes, the HR trend and Rest score are
         // day-scoped, so navigating must re-fetch them for the newly selected window.
-        .task(id: TodayLoadKey(seq: repo.refreshSeq, offset: selectedDayOffset)) { await loadAll() }
+        .task(id: TodayLoadKey(seq: repo.refreshSeq, offset: selectedDayOffset,
+                              dayCycleMode: dayCycleModeRaw)) { await loadAll() }
         // #989: hydration writes don't bump refreshSeq, so the card needs its own triggers, a logged /
         // edited / deleted drink (hydrationSeq) and the Settings feature toggle both re-read just the two
         // hydration fields. Cheap (one metricSeries row), never re-runs the heavy loads.
@@ -1528,6 +1534,9 @@ struct TodayView: View {
             ScoringGuideView(onClose: { showGuideTop = false })
         }
         // The Updates inbox (the header bell). Both platforms.
+        .sheet(isPresented: $showCoachLauncher) {
+            CoachLauncherSheet()
+        }
         .sheet(isPresented: $showUpdatesInbox) {
             UpdatesInboxView(onClose: { showUpdatesInbox = false })
         }
@@ -2569,6 +2578,11 @@ struct TodayView: View {
             // coupled day screen. An empty value renders just the icon + title + subtitle + chevron.
             pinnedCardRow(icon: card.icon, tint: tint, title: card.title, subtitle: card.subtitle,
                           value: dashboardValue(card), route: .coupled)
+        case .coach:
+            // #1862: a SHEET, not a push — Coach is a thing you dip into and dismiss, and pushing it
+            // would take you off Today, which is the discoverability problem this card exists to solve.
+            pinnedCardActionRow(icon: card.icon, tint: tint, title: card.title, subtitle: card.subtitle,
+                                value: dashboardValue(card)) { showCoachLauncher = true }
         }
     }
 
@@ -2590,6 +2604,7 @@ struct TodayView: View {
         case .calories:    return StrandPalette.metricAmber
         case .hydration:   return StrandPalette.metricCyan
         case .coupled:     return StrandPalette.chargeColor
+        case .coach:       return StrandPalette.accent
         }
     }
 
@@ -2698,6 +2713,10 @@ struct TodayView: View {
             // A tap-through row with no metric value of its own, the row shows just the chevron. Returning
             // an empty string (not "—") renders no number and leaves it un-dimmed (it isn't a missing value).
             return ""
+        case .coach:
+            // #1862: likewise a launcher row. Empty rather than "—" for the same reason — there is no
+            // missing measurement here, there is no measurement at all.
+            return ""
         }
     }
 
@@ -2709,37 +2728,56 @@ struct TodayView: View {
     private func pinnedCardRow(icon: String, tint: Color, title: String, subtitle: String,
                                value: String, route: TabRoute) -> some View {
         NavigationLink(value: route) {
-            HStack(spacing: 12) {
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .fill(tint.opacity(0.14))
-                    .frame(width: 34, height: 34)
-                    .overlay(Image(systemName: icon).font(.system(size: 15, weight: .semibold)).foregroundStyle(tint))
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title.uppercased())
-                        .font(StrandFont.overline)
-                        .tracking(StrandFont.overlineTracking)
-                        .foregroundStyle(StrandPalette.textPrimary)
-                        .lineLimit(1)
-                    Text(subtitle)
-                        .font(StrandFont.footnote)
-                        .foregroundStyle(StrandPalette.textTertiary)
-                        .lineLimit(1)
-                }
-                Spacer(minLength: 8)
-                // A real number reads white; a placeholder (, / Calibrating) reads dimmed so it doesn't
-                // masquerade as a value.
-                let isPlaceholder = (value == "—" || value == Self.calibratingPlaceholder)
-                Text(value).font(StrandFont.rounded(18, weight: .semibold))
-                    .foregroundStyle(isPlaceholder ? StrandPalette.textTertiary : StrandPalette.textPrimary)
-                Image(systemName: "chevron.right").font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(StrandPalette.textTertiary)
-            }
-            .padding(.horizontal, 13).padding(.vertical, 11)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(FrostedCardSurface(cornerRadius: NoopMetrics.cardRadius))
-            .contentShape(Rectangle())
+            pinnedCardRowBody(icon: icon, tint: tint, title: title, subtitle: subtitle, value: value)
         }
         .buttonStyle(.plain)
+    }
+
+    /// The same row, but it runs `action` instead of pushing a route (#1862).
+    ///
+    /// Coach is the one dashboard card that opens a SHEET rather than a screen, so it cannot ride
+    /// `NavigationLink`. Both wrappers render `pinnedCardRowBody`, so the two kinds of row cannot drift
+    /// apart visually — which duplicating the HStack for one caller would have guaranteed eventually.
+    private func pinnedCardActionRow(icon: String, tint: Color, title: String, subtitle: String,
+                                     value: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            pinnedCardRowBody(icon: icon, tint: tint, title: title, subtitle: subtitle, value: value)
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private func pinnedCardRowBody(icon: String, tint: Color, title: String, subtitle: String,
+                                   value: String) -> some View {
+        HStack(spacing: 12) {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(tint.opacity(0.14))
+                .frame(width: 34, height: 34)
+                .overlay(Image(systemName: icon).font(.system(size: 15, weight: .semibold)).foregroundStyle(tint))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title.uppercased())
+                    .font(StrandFont.overline)
+                    .tracking(StrandFont.overlineTracking)
+                    .foregroundStyle(StrandPalette.textPrimary)
+                    .lineLimit(1)
+                Text(subtitle)
+                    .font(StrandFont.footnote)
+                    .foregroundStyle(StrandPalette.textTertiary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            // A real number reads white; a placeholder (, / Calibrating) reads dimmed so it doesn't
+            // masquerade as a value.
+            let isPlaceholder = (value == "—" || value == Self.calibratingPlaceholder)
+            Text(value).font(StrandFont.rounded(18, weight: .semibold))
+                .foregroundStyle(isPlaceholder ? StrandPalette.textTertiary : StrandPalette.textPrimary)
+            Image(systemName: "chevron.right").font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(StrandPalette.textTertiary)
+        }
+        .padding(.horizontal, 13).padding(.vertical, 11)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(FrostedCardSurface(cornerRadius: NoopMetrics.cardRadius))
+        .contentShape(Rectangle())
     }
 
     // MARK: Component 2, explained score note (calibrating / carried / needs-strap)
@@ -4611,6 +4649,8 @@ struct TodayView: View {
         // Rest series + the two provenance resolves, all day-keyed outputs, none consumes another's
         // result, so fire them concurrently and await where first used.
         async let restSeriesA       = repo.exploreSeries(key: "sleep_performance", source: "my-whoop")
+        async let dayCycleSeriesA   = repo.exploreSeries(
+            key: DayCycleIntelligenceIntegration.onsetKey, source: "my-whoop")
         async let recoveryResolvedA = repo.resolvedSeries(key: "recovery", source: Repository.whoopSource)
         async let restResolvedA     = repo.resolvedSeries(key: "sleep_performance", source: Repository.whoopSource)
 
@@ -4618,6 +4658,7 @@ struct TodayView: View {
         // `sleep_performance` (imported-wins), so a Bluetooth-only user sees the on-device Rest
         // composite and an importer sees the export's figure, exactly like the Rest detail screen.
         let restSeries = await restSeriesA
+        let dayCycleSeries = await dayCycleSeriesA
         let restByDay = Dictionary(restSeries.map { ($0.day, $0.value) }, uniquingKeysWith: { _, last in last })
         // The Rest TILE's sparkline (#614 follow-up). The tile's number is `restScore` (the Rest composite,
         // 0–100) but its mini-graph used to plot raw sleep MINUTES (`sparks["sleep_total_min"]`), so the
@@ -4667,11 +4708,20 @@ struct TodayView: View {
         // in the small hours after midnight today still starts at yesterday's midnight rather than
         // blanking to an empty new-calendar-day axis (#144).
         let dayStart = Calendar.current.startOfDay(for: selectedLogicalDay)
-        let windowStart = Int(dayStart.timeIntervalSince1970)
-        let windowEnd: Int = selectedDayOffset == 0
+        let calendarStart = Int(dayStart.timeIntervalSince1970)
+        let calendarEnd: Int = selectedDayOffset == 0
             ? Int(Date().timeIntervalSince1970)
             : Int((Calendar.current.date(byAdding: .day, value: 1, to: dayStart) ?? dayStart).timeIntervalSince1970)
-        let hrPointsLocal = await repo.hrBuckets(from: windowStart, to: windowEnd, bucketSeconds: 300)
+        let nextDay = Calendar.current.date(byAdding: .day, value: 1, to: dayStart) ?? dayStart
+        let nextDayKey = Repository.localDayKey(nextDay)
+        let cycleMarkers = dayCycleMode == .sleepOnset
+            ? await repo.exploreSeries(key: DayCycleIntelligenceIntegration.onsetKey, source: "my-whoop") : []
+        let windowStart = cycleMarkers.last(where: { $0.day == selectedDayKey }).map { Int($0.value) }
+            ?? calendarStart
+        let windowEndExclusive = cycleMarkers.last(where: { $0.day == nextDayKey }).map { Int($0.value) }
+            ?? calendarEnd
+        let windowEndInclusive = max(windowStart, windowEndExclusive - 1)
+        let hrPointsLocal = await repo.hrBuckets(from: windowStart, to: windowEndInclusive, bucketSeconds: 300)
             .map { TrendPoint(date: Date(timeIntervalSince1970: TimeInterval($0.ts)), value: $0.bpm) }
         hrPoints = hrPointsLocal
 
@@ -4681,7 +4731,7 @@ struct TodayView: View {
         // canonical UNION (like the HR curve / Effort above): a re-added strap banks its live step samples
         // under its OWN fresh id, so a read pinned to the canonical "my-whoop" would drop the icon for a
         // re-added strap (the #904/#908 family). nil (no classed sample) hides the icon.
-        let stepClassLocal = await repo.stepActivityClassLatest(from: windowStart, to: windowEnd)
+        let stepClassLocal = await repo.stepActivityClassLatest(from: windowStart, to: windowEndInclusive)
         stepActivityClassToday = stepClassLocal
 
         // #860 item 1: the launch auto-land (#605/#739 "snap to the most recent data day when today is
@@ -4698,7 +4748,11 @@ struct TodayView: View {
         // gauge falls back to the stored row (never a fabricated value); a navigated past day clears it.
         let liveStrainLocal: Double?
         if selectedDayOffset == 0 {
-            let todayHr = await repo.hrSamples(from: windowStart, to: windowEnd)
+            let mode = DayCycleMode.persisted(UserDefaults.standard.string(forKey: DayCycleMode.storageKey))
+            let cycleOnset = dayCycleSeries.last(where: { $0.day <= selectedDayKey })
+                .map { Int($0.value.rounded()) }
+            let effortStart = mode == .sleepOnset ? (cycleOnset ?? windowStart) : windowStart
+            let todayHr = await repo.hrSamples(from: effortStart, to: windowEndInclusive)
             let maxHR = profile.age > 0 ? StrainScorer.tanakaHRmax(age: Double(profile.age)) : nil
             let restHR = displayDay?.restingHr.map(Double.init) ?? StrainScorer.defaultRestingHR
             liveStrainLocal = StrainScorer.strain(todayHr, maxHR: maxHR, restingHR: restHR,
@@ -4710,7 +4764,7 @@ struct TodayView: View {
         // Pin the chart axis to the loaded window, today midnight→now, a past day the full 24h, so
         // a gap (e.g. a morning the strap wasn't banking) shows as empty space, not a late start.
         let newAxis = Date(timeIntervalSince1970: TimeInterval(windowStart))
-            ... Date(timeIntervalSince1970: TimeInterval(windowEnd))
+            ... Date(timeIntervalSince1970: TimeInterval(windowEndExclusive))
         // #829 - keep the HR zoom VALID across reloads. The window changes on a day step (a whole new day)
         // and, on today, each refresh nudges the end to a fresh `now`. A day step clears the zoom so the new
         // day opens at full scale; a same-day end-extension keeps the user's zoom but RE-CLAMPS it into the
@@ -4728,7 +4782,7 @@ struct TodayView: View {
         // read for a night stored as more than one block (#294). Drives the HR sleep band + the recovery
         // marker's wake anchor.
         let overlapping = await repo.allSleepSessions(days: selectedDayOffset + 2)
-            .filter { $0.endTs > windowStart && $0.startTs < windowEnd }
+            .filter { $0.endTs > windowStart && $0.startTs < windowEndExclusive }
         let habitualMidsleepSecLocal = await repo.habitualMidsleepSec()
         let sleepTodayLocal = SleepView.mainNightSpan(overlapping, habitualMidsleepSec: habitualMidsleepSecLocal)
             .map { span in
@@ -5104,6 +5158,7 @@ struct TodayView: View {
 private struct TodayLoadKey: Equatable {
     let seq: Int
     let offset: Int
+    let dayCycleMode: String
 }
 
 /// #849: an in-memory snapshot of everything `loadHistoryWide()` computes: the ~40 history-wide reads +

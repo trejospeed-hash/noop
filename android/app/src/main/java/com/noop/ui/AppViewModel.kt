@@ -13,6 +13,7 @@ import com.noop.analytics.Baselines
 import com.noop.analytics.IllnessSignalEngine
 import com.noop.analytics.IllnessWatch
 import com.noop.analytics.IntelligenceEngine
+import com.noop.analytics.DayCycleIntelligenceIntegration
 import com.noop.analytics.CircadianEngine
 import com.noop.analytics.V5HealthSignals
 import com.noop.analytics.RegistryDayOwnerSource
@@ -52,6 +53,7 @@ import com.noop.protocol.CommandNumber
 import com.noop.widget.WidgetSnapshot
 import com.noop.widget.WidgetSnapshotStore
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
@@ -61,6 +63,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
@@ -719,6 +724,33 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     /**
+     * Today's measured steps follow the newest confirmed sleep-onset cycle, independently of the fixed
+     * 04:00 presentation day used by the rest of the dashboard. The marker is persisted by the analytics
+     * pass, so this survives process death and a delayed sleep detection can switch the tile retroactively.
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    internal val activeDayCycle: StateFlow<ActiveDayCycle?> = activeStrapIdFlow
+        .map { effectiveActiveStrapId(it, deviceId) }
+        .distinctUntilChanged()
+        .flatMapLatest { activeId ->
+            repository.recentDaysMergedFlow(activeId).flatMapLatest days@{ days ->
+                if (days.isEmpty()) return@days flowOf(null)
+                val from = days.first().day
+                val to = days.last().day
+                combine(
+                    repository.computedDailyUnionFlow(activeId, from, to),
+                    repository.metricSeriesComputedUnionFlow(
+                        activeId, DayCycleIntelligenceIntegration.ONSET_KEY, from, to,
+                    ),
+                ) { computed, markers ->
+                    resolveActiveDayCycle(days, computed, markers, System.currentTimeMillis() / 1_000L)
+                }
+            }
+        }
+        .flowOn(Dispatchers.IO)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    /**
      * #103: SpO₂ candidate @82 nightly mean per day, loaded from the "spo2_candidate" metricSeries
      * key (written by IntelligenceEngine when the experimental display toggle is ON). Empty when the
      * toggle is OFF or no candidate data exists — the Blood O₂ tile then behaves exactly as before.
@@ -852,8 +884,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // is deliberately inert on the WHOOP path and never touches WhoopBleClient internals; this class
         // already owns the registry handle and a scope. Twin of Swift `BLEManager.adoptWhoopSerialIdentity`.
         //
-        // A WHOOP 4.0 never reaches here: it exposes no DIS serial, and the 4.0 serial's source on the wire
-        // is not yet identified, so there is nothing honest to adopt onto.
+        // A WHOOP 4.0 reaches here by a different road: it exposes no DIS serial, so its serial is decoded
+        // from the GET_HELLO_HARVARD response (`Whoop4HelloSerial`) and handed to this same callback only
+        // after a SECOND sighting of the same value — see `WhoopBleClient.noteHarvardSerial` for why a 4.0
+        // waits where a 5/MG adopts on the first read (#1193).
         ble.onSerial = { serial ->
             viewModelScope.launch {
                 val serialId = com.noop.data.WhoopSerialIdentity.adoptedId(serial)
@@ -1187,6 +1221,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         // persists the nightly @82 mean as "spo2_candidate" in metricSeries.
                         spo2CandidateDisplay = NoopPrefs.spo2CandidateDisplay(appContext),
                         effortMethod = NoopPrefs.effortMethod(appContext),
+                        dayCycleMode = NoopPrefs.dayCycleMode(appContext),
                     )
                     // analyzeRecent now hops to Dispatchers.Default; a scope cancellation surfaces as a
                     // CancellationException that runCatching would otherwise swallow, breaking the loop's
@@ -1825,6 +1860,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 // #103: SpO₂ candidate @82 display toggle — same flag the 15-min loop reads.
                 spo2CandidateDisplay = NoopPrefs.spo2CandidateDisplay(appContext),
                 effortMethod = NoopPrefs.effortMethod(appContext),
+                dayCycleMode = NoopPrefs.dayCycleMode(appContext),
             )
         }.onFailure { if (it is kotlin.coroutines.cancellation.CancellationException) throw it }
     }
@@ -2674,6 +2710,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      *  which the toggle's own copy promises. Twin of the iOS onChange handler. */
     fun setBanisterEffort(enabled: Boolean) {
         NoopPrefs.setBanisterEffort(appContext, enabled)
+        viewModelScope.launch { rescoreAfterEdit() }
+    }
+
+    /** Change the shared boundary used by additive daily metrics and immediately rebuild affected rows. */
+    fun setDayCycleMode(mode: com.noop.analytics.DayCycleMode) {
+        NoopPrefs.setDayCycleMode(appContext, mode)
         viewModelScope.launch { rescoreAfterEdit() }
     }
 

@@ -21,6 +21,7 @@ final class IntelligenceEngine: ObservableObject {
     /// is worth the few characters.
     static let minHrSamples = 200
 
+    private let dayCycleCache = DayCycleIntelligenceIntegration.Cache()
     private let repo: Repository
     private let profile: ProfileStore
     /// The CANONICAL id under whose `-noop` sibling this engine WRITES the computed daily rows, and from
@@ -746,7 +747,7 @@ final class IntelligenceEngine: ObservableObject {
         // and the Sleep tab resolve to the identical block. (#547)
         let (habitualMidsleepSec, nightlyHours) = await Self.computeHabitualSleep(
             store: store, importedId: deviceId, computedId: deviceId + "-noop",
-            windowStart: nowLocalMidnight - maxDays * 86_400 - 30 * 3_600,
+            windowStart: nowLocalMidnight - maxDays * 86_400 - StreamReadCap.lookbackSeconds,
             windowEnd: now, offsetSec: tzOffset)
         // Wave 0 (SL1/T1): personal sleep REGULARITY + population-anchored NEED, computed ONCE from the
         // trailing per-night durations and threaded to every analyzeDay below (mirrors the midsleep
@@ -802,6 +803,7 @@ final class IntelligenceEngine: ObservableObject {
         // #1545: the Effort TRIMP recipe, read ONCE per pass. Global (same for every day), so it folds
         // into the config signature below rather than the per-day key.
         let effortMethodGlobal = PuffinExperiment.effortMethod
+        let dayCycleMode = DayCycleMode.persisted(UserDefaults.standard.string(forKey: DayCycleMode.storageKey))
 
         // ── #1005 BATTERY: per-day reuse cache setup (see `dayScanCache`) ────────────────────────────
         // The stager toggles are read per-day inside the loop below, but they are global (same value every
@@ -854,6 +856,7 @@ final class IntelligenceEngine: ObservableObject {
             // produced under one method is stale the moment the user switches — serving it would show a
             // window of days scored by a recipe the user just turned off, with nothing to explain it.
             "\(effortMethodGlobal)",
+            dayCycleMode.rawValue,
         ].joined(separator: "|")
         // Drop the whole cache on a config change, then snapshot it into a Sendable `let` for the detached
         // loop (the engine is @MainActor; the loop can't touch `self`). The loop returns the updated cache
@@ -880,7 +883,7 @@ final class IntelligenceEngine: ObservableObject {
             var skippedSleepDays: [(day: String, hrSamples: Int)] = []
             // #938: the WHOOP 4.0 ADC offset is per-device, not per-night. Learn one anchor per owner
             // from the whole scan window and reuse it for every night so cross-night deviations survive.
-            let skinAnchorScanFrom = nowLocalMidnight - (maxDays - 1) * 86_400 - 30 * 3_600
+            let skinAnchorScanFrom = nowLocalMidnight - (maxDays - 1) * 86_400 - StreamReadCap.lookbackSeconds
             let skinAnchorScanTo = nowLocalMidnight + 18 * 3_600
             var skinAnchorByOwner: [String: Double] = [:]
             var skinAnchorResolvedOwners = Set<String>()
@@ -904,24 +907,27 @@ final class IntelligenceEngine: ObservableObject {
             // planner cannot prove safe falls back to exactly the read that shipped before them. HR and
             // R-R only: the other eight streams are thousands of rows against these two's tens of
             // thousands, so this is nearly all of the win for two call sites of blast radius.
-            // ONE binding, used as both the read cap and the window's truncation threshold. They must be
-            // the same number: the window declines to slice a read that came back at the cap, because
-            // `ORDER BY ts ASC LIMIT` drops the NEWEST rows. Were the two to drift apart, a truncated read
-            // would stop being recognised and the buffer would be sliced while missing its tail — wrong
-            // scoring inputs, silently. The Kotlin twin cannot drift because it uses `STREAM_LIMIT` for
-            // both; this is the same guarantee spelled locally.
-            let streamLimit = 200_000
-            let hrWindow = SlidingStreamWindow<HRSample>(tsOf: { $0.ts }, limit: streamLimit) { o, f, t in
-                try? await store.hrSamples(deviceId: o, from: f, to: t, limit: streamLimit)
+            // Each window's read cap and its truncation threshold must be the SAME number: the window
+            // declines to slice a read that came back at the cap, because `ORDER BY ts ASC LIMIT` drops the
+            // NEWEST rows. Were the two to drift apart, a truncated read would stop being recognised and the
+            // buffer would be sliced while missing its tail — wrong scoring inputs, silently. Passing one
+            // `StreamReadCap` value into both slots below keeps that guarantee per stream.
+            //
+            // #1538: the two streams no longer share ONE cap. 200,000 was sized for HR (a full 54h window is
+            // ~194,400 rows, 3% under) and silently truncated R-R, which is per-BEAT and runs to 233k-389k
+            // over the same window. A field capture showed `rr[... truncated=10]` — ten nights scored on R-R
+            // missing its tail. See `StreamReadCap` for the arithmetic.
+            let hrWindow = SlidingStreamWindow<HRSample>(tsOf: { $0.ts }, limit: StreamReadCap.hr) { o, f, t in
+                try? await store.hrSamples(deviceId: o, from: f, to: t, limit: StreamReadCap.hr)
             }
-            let rrWindow = SlidingStreamWindow<RRInterval>(tsOf: { $0.ts }, limit: streamLimit) { o, f, t in
-                try? await store.rrIntervals(deviceId: o, from: f, to: t, limit: streamLimit)
+            let rrWindow = SlidingStreamWindow<RRInterval>(tsOf: { $0.ts }, limit: StreamReadCap.rr) { o, f, t in
+                try? await store.rrIntervals(deviceId: o, from: f, to: t, limit: StreamReadCap.rr)
             }
             for offset in 0..<maxDays {
                 let dayStart = nowLocalMidnight - offset * 86_400
                 let day = AnalyticsEngine.dayString(dayStart, offsetSec: tzOffset)
                 // Read a generous window around the night that ends on `day`; the stager finds the span.
-                let from = dayStart - 30 * 3_600
+                let from = dayStart - StreamReadCap.lookbackSeconds
                 // Sleep read-window END — see `sleepReadWindowEnd`.
                 let to = Self.sleepReadWindowEnd(dayStart: dayStart,
                                                  nowLocalMidnight: nowLocalMidnight,
@@ -1020,7 +1026,8 @@ final class IntelligenceEngine: ObservableObject {
                                                              limit: 200_000)) ?? []
                 let resp = OuraRespScale.forScoring(respRows, deviceId: owner)
                 let vendorResp = OuraRespScale.forVendorRate(respRows, deviceId: owner)
-                let grav = (try? await store.gravitySamples(deviceId: owner, from: from, to: to, limit: 200_000)) ?? []
+                let grav = (try? await store.gravitySamples(deviceId: owner, from: from, to: to,
+                                                            limit: StreamReadCap.gravity)) ?? []
                 let steps = (try? await store.stepSamples(deviceId: owner, from: from, to: to, limit: 200_000)) ?? []
                 let skin = (try? await store.skinTempSamples(deviceId: owner, from: from, to: to, limit: 200_000)) ?? []
                 // #93: WHOOP 4.0 raw SpO2 PPG samples for the night; analyzeDay banks the nightly red/IR ADC
@@ -1728,7 +1735,7 @@ final class IntelligenceEngine: ObservableObject {
         // re-labelled rows (both written under `deviceId`), and apple-health carries Health imports ,
         // a detected bout overlapping ANY of them is skipped below. Port of the Android dedup block.
         // (`computedId` is bound once above, before the off-actor scan loop.)
-        let windowStart = now - maxDays * 86_400 - 30 * 3_600
+        let windowStart = now - maxDays * 86_400 - StreamReadCap.lookbackSeconds
         var realWorkouts = (try? await store.workouts(deviceId: deviceId, from: windowStart,
                                                        to: now, limit: 100_000)) ?? []
         realWorkouts += (try? await store.workouts(deviceId: "apple-health", from: windowStart,
@@ -1761,6 +1768,49 @@ final class IntelligenceEngine: ObservableObject {
         // already staged from raw (idempotent) and for imported nights (raw never dense). This MUST run
         // before the scoring loop so the healed stages flow into Rest/recovery this same pass.
         let editedRows = await repo.selfHealEditedStages(from: windowStart, to: now)
+        var cycleCandidates: [(owner: String, priority: Int)] = regDevices
+            .map { device in
+                let priority: Int
+                if device.id == regActiveId { priority = 0 }
+                else if device.status == .archived { priority = 4 }
+                else if device.sourceKind == .activityFile { priority = 3 }
+                else if device.isImportSource { priority = 2 }
+                else { priority = 1 }
+                return (device.id, priority)
+            }
+        if !cycleCandidates.contains(where: { $0.owner == regActiveId }) {
+            cycleCandidates.append((regActiveId, 0))
+        }
+        let physiologyOwners = ([regActiveId] + regDevices.filter {
+            $0.brand.caseInsensitiveCompare("WHOOP") == .orderedSame
+        }.map(\.id) + [Repository.whoopSource]).reduce(into: [String]()) {
+            if !$0.contains($1) { $0.append($1) }
+        }
+        let cycleWorkouts = await repo.workoutRows(days: maxDays + 2)
+        let physiologicalSteps = await DayCycleIntelligenceIntegration.compute(
+            nights: scoredNights.map { night in
+                DayCycleIntelligenceIntegration.Night(
+                    daily: night.daily,
+                    sleeps: night.cachedSleep,
+                    workouts: night.workouts,
+                    owner: resolvedScoreOwnerByDay[night.daily.day] ?? regActiveId)
+            },
+            editedRows: editedRows,
+            store: store,
+            candidates: cycleCandidates,
+            physiologyOwners: physiologyOwners,
+            workouts: cycleWorkouts,
+            windowStart: windowStart,
+            now: now,
+            offsetSec: tzOffset,
+            habitualMidsleepSec: habitualMidsleepSec,
+            ticksPerStep: up.stepTicksPerStep,
+            mode: dayCycleMode,
+            cache: dayCycleCache,
+            profile: up,
+            maxHROverride: maxHR,
+            effortMethod: effortMethodGlobal,
+            trace: stepsTraceActive ? { self.diagnosticSink?($0, .steps) } : nil)
         // #299: `editsByStart` is now built PER DAY inside the scoring loop (scoped to the day each edit
         // belongs to), NOT window-wide here. sleepEditedDaily folds any edited row that isn't a twin of THIS
         // day's detected sessions in as a "manual" block, so a window-wide edit set let ONE user edit /
@@ -1805,8 +1855,9 @@ final class IntelligenceEngine: ObservableObject {
             // every night. `effectiveStartTs` (the #318 user-corrected onset) is preserved on the row.
             let dayEditedRows = Self.editedRowsForDay(editedRows, day: night.daily.day, tzOffsetSeconds: tzOffset)
             let editsByStart = Dictionary(dayEditedRows.map { ($0.startTs, $0) }, uniquingKeysWith: { a, _ in a })
-            let daily = sleepEditedDaily(night.daily, detected: night.cachedSleep, editsByStart: editsByStart,
+            var daily = sleepEditedDaily(night.daily, detected: night.cachedSleep, editsByStart: editsByStart,
                                          habitualMidsleepSec: habitualMidsleepSec)
+            daily = DayCycleIntelligenceIntegration.applying(physiologicalSteps, to: daily)
             let recovery = recomputeRecovery(daily, baselines2)
             // Charge term-breakdown trace (Group G): only when the Recovery test mode is on. Emits which
             // term moved Charge and which was nil and forced the renorm, tagged `.recovery`. The trace's
@@ -1826,7 +1877,7 @@ final class IntelligenceEngine: ObservableObject {
             // off the HRV baseline state rather than a blanket `.solid`, so a thin/provisional baseline shows
             // EST. not REL. Pure presentation upstream of the UI; the score itself is unchanged.
             let chargeConf = ScoreConfidence.charge(recovery: recovery, hrvBaseline: baselines2.hrv)
-            out.append(Computed(day: daily.day, recovery: recovery, strain: night.strain,
+            out.append(Computed(day: daily.day, recovery: recovery, strain: daily.strain,
                                 sleepMin: daily.totalSleepMin, hrv: daily.avgHrv,
                                 rhr: daily.restingHr, source: source, confidence: chargeConf,
                                 drivers: drivers, skinTempRel: skinRel))
@@ -1899,6 +1950,11 @@ final class IntelligenceEngine: ObservableObject {
                                       skinTempC: night.nightlySkin))
             if let rest = AnalyticsEngine.Rest.composite(daily: daily) {
                 restPoints.append(MetricPoint(day: daily.day, key: "sleep_performance", value: rest))
+            }
+            if let onset = physiologicalSteps.onsetByWakeDay[daily.day] {
+                restPoints.append(MetricPoint(day: daily.day,
+                                              key: DayCycleIntelligenceIntegration.onsetKey,
+                                              value: Double(onset)))
             }
             // #103: persist the SpO₂ candidate @82 nightly mean to metricSeries as "spo2_candidate" so the
             // Blood Oxygen tile can surface it as a "strap estimate (unverified)" fallback when the toggle
@@ -2104,13 +2160,29 @@ final class IntelligenceEngine: ObservableObject {
             provenanceByCell["\(point.day)\u{1F}\(point.key)"] =
                 ScoreInputProvenanceRow(day: point.day, key: point.key, sourceId: source)
         }
+        let markerKeys: [String]
+        let markerPoints: [SourcedMetricPoint]
+        let markerSources: [String]
+        switch physiologicalSteps.markerUpdate {
+        case .preserve:
+            markerKeys = []; markerPoints = []; markerSources = []
+        case let .replace(points, sourceIds):
+            markerKeys = [DayCycleIntelligenceIntegration.onsetKey]
+            markerPoints = points.map {
+                SourcedMetricPoint(deviceId: $0.deviceId, point: $0.point)
+            }
+            markerSources = sourceIds
+        }
         try? await store.persistComputedScores(
             dailyMetrics: dailies,
             metricPoints: restPoints,
             provenance: Array(provenanceByCell.values),
             deviceId: computedId,
             from: oldestDay,
-            to: newestDay
+            to: newestDay,
+            replaceMetricKeys: markerKeys,
+            additionalMetricPoints: markerPoints,
+            replaceMetricSourceIds: markerSources
         )
 
         // Now evict only the STALE computed rows in the window , those a prior (e.g. UTC-keyed) run left

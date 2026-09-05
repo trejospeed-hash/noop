@@ -190,6 +190,7 @@ struct SettingsView: View {
     @AppStorage(UnitPrefs.hrvWindowKey) private var hrvWindowRaw = HrvWindow.whole.rawValue
     // Live-HR Live Activity (Lock Screen + Dynamic Island), iOS only (#336). Default on.
     @AppStorage(UnitPrefs.liveActivityKey) private var liveActivityEnabled = true
+    @AppStorage(DayCycleMode.storageKey) private var dayCycleModeRaw = DayCycleMode.sleepOnset.rawValue
     // Alternate app icon (iOS only) — false = Titanium (primary AppIcon), true = Blue Titanium
     // ("AppIcon-Navy"). Display-only preference; the live switch goes through setAlternateIconName.
     @AppStorage("appIcon.alt") private var useNavyIcon = false
@@ -537,6 +538,27 @@ struct SettingsView: View {
                         }
                     }
                 }
+                rowDivider
+                FormRow(label: "Day cycle") {
+                    Picker("Day starts", selection: Binding(
+                        get: { DayCycleMode.persisted(dayCycleModeRaw) },
+                        set: { mode in
+                            dayCycleModeRaw = mode.rawValue
+                            Task { await model.intelligence.analyzeRecent(); await model.repo.refresh() }
+                        }
+                    )) {
+                        Text("Main sleep").tag(DayCycleMode.sleepOnset)
+                        Text("00:00").tag(DayCycleMode.midnight)
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                }
+                Text(dayCycleModeRaw == DayCycleMode.midnight.rawValue
+                     ? "Uses a conventional local calendar day from 00:00 to 00:00."
+                     : "Default. Steps and in-progress Effort restart at the beginning of detected main sleep. Naps do not start a new day; missing sleep falls back to local midnight.")
+                    .font(StrandFont.footnote)
+                    .foregroundStyle(StrandPalette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
                 rowDivider
                 // Step calibration (#139/#132): daily steps = @57 counter ticks ÷ this divisor.
                 // 1.0 = raw pass-through until the true 5/MG tick rate is known. The divisor goes
@@ -1563,7 +1585,7 @@ struct SettingsView: View {
         // Live HR over the UNBONDED standard profile (#69). True whenever the handshake is suppressed or
         // simply has not landed, and the honest description either way.
         if live.bonded && live.connected {
-            return String(localized: "Live heart rate is streaming, but your strap is not fully paired. The encrypted pairing is what carries motion, skin temperature, SpO₂ and respiratory rate — without it, sleep is staged from heart rate alone, and HRV and resting heart rate are unavailable. Buzz, alarms and history sync need it too.")
+            return String(localized: "Live heart rate is streaming, but your strap is not fully paired. The encrypted pairing is what carries motion, skin temperature, SpO₂ and respiratory rate — without it, sleep is staged from heart rate alone. Buzz, alarms and history sync need it too.")
         }
         if live.connected { return String(localized: "Connected. Finishing the secure pairing handshake…") }
         if live.bonded { return String(localized: "Previously paired but not currently connected. Re-scan to reconnect.") }
