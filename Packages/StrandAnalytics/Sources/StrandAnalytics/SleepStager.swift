@@ -71,6 +71,17 @@ public struct SleepSession: Equatable, Sendable {
 
 public enum SleepStager {
 
+    // MARK: - #1943: RHR bin-gate thresholds (shared by sessionRestingHR and rhrBinGateLogLine)
+    // One constant per threshold, read by both the gate and its conformance check, so a drift
+    // between the two is structurally impossible rather than merely documented.
+
+    /// Minimum samples in a 5-min bin for it to qualify as a candidate for the night's resting HR.
+    /// A one-sample bin at the edge of a wear gap cannot become the floor.
+    public static let rhrMinBinSamples: Int = 5
+    /// Minimum plausible mean HR (bpm) for a bin to qualify. A dropout-driven sub-physiological
+    /// dip cannot become the floor.
+    public static let rhrMinPlausibleBpm: Double = 25
+
     // MARK: - Stage 0 constants (sleep.py)
 
     /// Per-sample gravity change (g) at/below which a sample is "still".
@@ -2773,18 +2784,101 @@ public enum SleepStager {
     // MARK: - Per-session HR / HRV
 
     /// Lowest 5-min rolling-mean HR during the session (bpm), or nil.
+    ///
+    /// The window is CLOSED at both ends, so the binning is too: bins are `[t, t + windowS)` except
+    /// the final one, which is `[t, end]`. Half-open bins alone would admit a sample sitting exactly
+    /// on an aligned `end` through the prefilter and then place it in no bin — counted as data,
+    /// silently ignored. A zero-length window (`start == end`) is that single closed bin.
+    /// #1943: a conformance check that reports when the artefact gate `sessionRestingHR` applies
+    /// actually MOVED the floor. The shipped floor IS the gated floor, so comparing the gated floor
+    /// against it is silent by construction. Instead, this reports the UNGATED floor (the old rule:
+    /// min over every non-empty bin) against the shipped one, so the line fires when the gate
+    /// excluded the bin that would otherwise have won — which is exactly the frequency and magnitude
+    /// the measure-only diagnostic was meant to learn, and would never have reported otherwise.
+    ///
+    /// `sessionRestingHR` gates bins on `rhrMinBinSamples` and `rhrMinPlausibleBpm` before letting them
+    /// win the floor, falling back to the lowest of all bin means when no bin qualifies. This helper
+    /// reproduces the same partition and the same gate, and ALSO computes the ungated floor (min over
+    /// every non-empty bin, the pre-#1943 rule) so the two can be compared.
+    ///
+    /// Bins are built exactly as `sessionRestingHR` builds them, closed final bin included, or the line
+    /// would describe a different partition than the one it is judging.
+    ///
+    /// Returns nil unless the gate actually MOVED the floor (ungated != shipped), so the log carries
+    /// only the nights the gate did something. If it turns out to fire on one night in fifty, that is
+    /// worth knowing; if it fires nightly, that is worth knowing sooner.
+    ///
+    /// The counts still ride along when the line does fire, since they are the context for the change.
+    /// Same posture as the over-count-only R-R dump. Counts and bpm only, no timestamps. Pure. Twin of
+    /// Kotlin `rhrBinGateLogLine`.
+    public static func rhrBinGateLogLine(day: String, sessions: [(Int, Int)], hr: [HRSample],
+                                         shippedFloor: Int, minBinSamples: Int = rhrMinBinSamples,
+                                         minPlausibleBpm: Double = rhrMinPlausibleBpm) -> String? {
+        let windowS = 5 * 60
+        var bins = 0, thin = 0, implausible = 0, ungatedN = 0
+        var ungated: Double?
+        var gated: Double?
+        for (start, end) in sessions {
+            let seg = hr.filter { $0.ts >= start && $0.ts <= end }
+            if seg.isEmpty { continue }
+            var t = start
+            repeat {
+                let isFinal = t + windowS >= end
+                let win = seg.filter { $0.ts >= t && (isFinal || $0.ts < t + windowS) }
+                if !win.isEmpty {
+                    bins += 1
+                    let mean = Double(win.reduce(0) { $0 + $1.bpm }) / Double(win.count)
+                    if win.count < minBinSamples { thin += 1 }
+                    if mean < minPlausibleBpm { implausible += 1 }
+                    if ungated == nil || mean < ungated! { ungated = mean; ungatedN = win.count }
+                    if win.count >= minBinSamples, mean >= minPlausibleBpm,
+                       gated == nil || mean < gated! { gated = mean }
+                }
+                t += windowS
+            } while t < end
+        }
+        if bins == 0 { return nil }
+        let ungatedFloor = ungated.map { Int($0.rounded()) }
+        // The gate moved the floor when the ungated floor differs from the shipped one. The shipped
+        // floor IS the gated floor, so this fires when the gate excluded the bin that would have won
+        // under the old rule — which is the frequency and magnitude we want to learn.
+        let moved = ungatedFloor != nil && ungatedFloor != shippedFloor
+        if !moved { return nil }
+        let gatedFloor = gated.map { Int($0.rounded()) }
+        return "rhr bins day=\(day) bins=\(bins) thin=\(thin) implausible=\(implausible) "
+            + "winnerN=\(ungatedN) ungated=\(ungatedFloor.map(String.init) ?? "nil") "
+            + "gated=\(gatedFloor.map(String.init) ?? "nil") shipped=\(shippedFloor) gateMoved=\(moved)"
+    }
+
     static func sessionRestingHR(start: Int, end: Int, hr: [HRSample]) -> Int? {
         let seg = hr.filter { $0.ts >= start && $0.ts <= end }
         guard !seg.isEmpty else { return nil }
         let windowS = 5 * 60
-        var means: [Double] = []
+        // #1943: a bin qualifies to WIN the floor only when it is well-populated (≥ rhrMinBinSamples)
+        // and its mean is physiologically plausible (≥ rhrMinPlausibleBpm). A one-sample bin at the
+        // edge of a wear gap, or a dropout-driven sub-physiological dip, cannot become the night's
+        // resting HR — that number is displayed, stored on the daily row, and fed to the baseline
+        // later nights are scored against. If no bin qualifies, fall back to the lowest of ALL bin
+        // means (ungated), then the all-sample mean — preserving the never-null-on-data behaviour.
+        var gatedMeans: [Double] = []
+        var allMeans: [Double] = []
         var t = start
-        while t < end {
-            let win = seg.filter { $0.ts >= t && $0.ts < t + windowS }
-            if !win.isEmpty { means.append(Double(win.reduce(0) { $0 + $1.bpm }) / Double(win.count)) }
+        repeat {
+            // The last bin (its half-open end reaches or passes `end`) closes on `end` instead,
+            // catching an endpoint sample the prefilter already admitted. `seg` holds nothing past
+            // `end`, so "everything from t onwards" IS [t, end]. `repeat` runs once for a
+            // zero-length window, where that single closed bin is the whole window.
+            let isFinal = t + windowS >= end
+            let win = seg.filter { $0.ts >= t && (isFinal || $0.ts < t + windowS) }
+            if !win.isEmpty {
+                let mean = Double(win.reduce(0) { $0 + $1.bpm }) / Double(win.count)
+                allMeans.append(mean)
+                if win.count >= rhrMinBinSamples && mean >= rhrMinPlausibleBpm { gatedMeans.append(mean) }
+            }
             t += windowS
-        }
-        if let m = means.min() { return Int(m.rounded()) }
+        } while t < end
+        if let m = gatedMeans.min() { return Int(m.rounded()) }
+        if let m = allMeans.min() { return Int(m.rounded()) }
         let all = Double(seg.reduce(0) { $0 + $1.bpm }) / Double(seg.count)
         return Int(all.rounded())
     }
@@ -2802,12 +2896,42 @@ public enum SleepStager {
     /// Uses the same range-filter + ≥2-valid-interval rule as hrv.rmssd().
     static func sessionAvgHRV(start: Int, end: Int, rr: [RRInterval]) -> Double? {
         let vals = sessionHrvWindows(start: start, end: end, rr: rr, stages: []).compactMap { $0.rmssd }
-        return vals.isEmpty ? nil : vals.reduce(0, +) / Double(vals.count)
+        if vals.isEmpty { return nil }
+        // #1118: refuse the night outright when its own R-R banks more beat-time than the wall clock it
+        // spans. Gated HERE rather than at the caller because this is where RMSSD BECOMES the day's HRV:
+        // one seam covers the daily row, the sleep-session cache, the Health card and the baseline that
+        // later nights are scored against, so none of them can end up disagreeing about whether the night
+        // was trustworthy. See `HRVAnalyzer.successiveDiffIsTrustworthy` for why an over-count corrupts a
+        // successive-difference statistic and why a blank is the right answer.
+        //
+        // Classified over the SAME beats the value was built from, windowed [start, end] exactly as
+        // `sessionHrvWindows` does, so the verdict cannot describe a different set of beats than the number
+        // it is gating.
+        let seg = rr.filter { $0.ts >= start && $0.ts <= end }
+        let segTs = seg.map { $0.ts }
+        let segMs = seg.map { Double($0.rrMs) }
+        let coverage = HRVAnalyzer.rrCoverage(tsSec: segTs, rrMs: segMs)
+        // `collapsed` is deliberately the SAME figure as `coverage`, which pins every over-count here to
+        // crossSecondOverCount. That is not a claim about which kind it is. The collapsed figure exists only
+        // to choose BETWEEN the two over-count verdicts, and this gate refuses both, so the real one would
+        // change no outcome — while costing a full sort of the night's ~50-70k beats, since
+        // `collapsedCoverage` opens with a sort. This runs per session, per day, across ~21 days of every
+        // analyzeRecent, every 15 minutes; #1510 cut this exact path from six sorts a night to two, and
+        // buying a distinction the caller discards would hand that back. `rrCoverage` is a single O(n)
+        // pass. If a future gate ever needs the two over-count cases apart, compute it then.
+        let verdict = HRVAnalyzer.classifyCoverage(coverage: coverage, collapsed: coverage)
+        guard HRVAnalyzer.successiveDiffIsTrustworthy(verdict) else { return nil }
+        return vals.reduce(0, +) / Double(vals.count)
     }
 
     /// Per-5-min-window RMSSD across a session, each window tagged with the sleep stage at its CENTER
     /// (from `stages`) — the SINGLE source `sessionAvgHRV` averages, and the HRV nightly trace reads.
     /// Passing `[]` for `stages` tags every window "?" (the plain-average path needs no stages). (#141)
+    ///
+    /// Windows follow the same closed-window rule as `sessionRestingHR`: `[t, t + windowS)` except
+    /// the final one, which is `[t, end]`, so a beat sitting exactly on an aligned `end` lands in a
+    /// window instead of being admitted by the prefilter and then dropped. Window stage tagging and
+    /// `startTs` are unchanged — the final window keeps its half-open center `t + windowS / 2`.
     static func sessionHrvWindows(start: Int, end: Int, rr: [RRInterval], stages: [StageSegment]) -> [HrvWindow] {
         // CONTRACT: `rr` MUST already be ts-sorted (RMSSD is built from SUCCESSIVE differences, so a bucket
         // has to be chronological). The value path passes the loop's pre-sorted `rrS`; the trace caller sorts
@@ -2818,8 +2942,12 @@ public enum SleepStager {
         let windowS = 5 * 60
         var out: [HrvWindow] = []
         var t = start
-        while t < end {
-            let bucket = seg.filter { $0.ts >= t && $0.ts < t + windowS }.map { Double($0.rrMs) }
+        repeat {
+            // Final window closes on `end` — same closed-window rule as sessionRestingHR, so an
+            // endpoint beat counts instead of vanishing after admission. `repeat` runs once for a
+            // zero-length window, where that single closed window is the whole session.
+            let isFinal = t + windowS >= end
+            let bucket = seg.filter { $0.ts >= t && (isFinal || $0.ts < t + windowS) }.map { Double($0.rrMs) }
             // Full clean (range + Malik ectopic rejection), not just range — matches the
             // analyze() pipeline. The 0x2A37 RR on a WHOOP 5/MG is PPG-derived and noisier
             // than a 4.0's; rMSSD is built from SUCCESSIVE differences, so an un-rejected
@@ -2832,7 +2960,7 @@ public enum SleepStager {
             let stage = stages.first { center >= $0.start && center < $0.end }?.stage ?? "?"
             out.append(HrvWindow(startTs: t, stage: stage, cleanBeats: cleaned.nn.count, rmssd: rmssd))
             t += windowS
-        }
+        } while t < end
         return out
     }
 
