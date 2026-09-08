@@ -35,6 +35,55 @@ internal const val SPO2_CANDIDATE_ATTRIBUTION_SOURCE = "spo2-candidate-estimate"
 internal fun vo2MaxAttributionSource(estimator: Vo2MaxEstimator?): String =
     VO2_MAX_ATTRIBUTION_PREFIX + (estimator?.provenanceId ?: "unknown")
 
+/**
+ * The y-domain a metric should be drawn against, or null to scale to the data.
+ *
+ * Auto-scaling makes a calm metric look exactly as violent as a wild one: Rest moving 46..93 on a 0..100
+ * scale fills the same full height as Effort moving 0..42, and one low day rewrites the whole shape. For a
+ * metric whose natural range IS its interesting range, anchoring is what makes the height mean something.
+ *
+ * Deliberately a small allow-list rather than "percentages get 0..100". Blood oxygen is a percentage whose
+ * real movement lives in 90..100, so anchoring it to the nominal range would flatten the signal into a line
+ * at the top: strictly worse than auto-scaling. Resting HR, HRV and skin temperature have no fixed range at
+ * all.
+ *
+ * Effort is 0..100 here whatever the user's display scale says. The readings store the RAW 0-100 composite
+ * and only `format()` converts to the 0..21 reading, so the chart plots the stored value. Taking the domain
+ * from the display scale would have squashed every Effort chart on a WHOOP-scale install into the bottom
+ * fifth of its height.
+ */
+internal fun vitalChartYDomain(key: String): ClosedFloatingPointRange<Double>? =
+    when (key) {
+        // "rest", NOT "sleep_performance": that is the SERIES name this detail reads underneath, and it is
+        // never a detail key on Android. Writing the series name here compiled, passed a test asserting it,
+        // and left the Rest chart auto-scaling exactly as before.
+        // A ZERO-WIDTH domain at 0, not 0..100. The chart widens a domain to contain the data, so this
+        // pins the FLOOR at zero while the ceiling follows the readings.
+        //
+        // Anchoring at 100 was the first attempt and it overcorrected: Effort peaks in the low forties, so
+        // the top ~58% of the chart sat permanently empty, and Rest at 46..93 wasted the bottom half. A
+        // zero floor keeps what actually mattered, that heights stay comparable and a 0.0 day reads as the
+        // floor rather than as the middle, without spending most of the height on range nobody reaches.
+        "recovery", "rest", "strain" -> 0.0..0.0
+        else -> null
+    }
+
+/**
+ * Per-reading epoch seconds from the day keys, or null when any day fails to parse.
+ *
+ * All-or-nothing on purpose: a partially-parsed list would position some points by time and the rest by a
+ * fallback, which is a worse lie than either rule applied consistently. Returning null makes the chart use
+ * index spacing, exactly as before.
+ */
+internal fun dayEpochSeconds(readings: List<VitalReading>): List<Long>? {
+    val out = ArrayList<Long>(readings.size)
+    for (r in readings) {
+        val day = runCatching { java.time.LocalDate.parse(r.day) }.getOrNull() ?: return null
+        out += day.toEpochDay() * 86_400L
+    }
+    return out
+}
+
 /** Sequential ids for a method-aware trend. Nes → Uth → Nes becomes three segments rather than joining
  *  the non-adjacent Nes runs across an incompatible estimator. */
 internal fun vo2MaxTrendSegmentIds(readings: List<VitalReading>): List<String> {

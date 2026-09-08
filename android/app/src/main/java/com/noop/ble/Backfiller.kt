@@ -1,6 +1,7 @@
 package com.noop.ble
 
 import android.content.Context
+import android.content.SharedPreferences
 import com.noop.data.DynAccelDiag
 import com.noop.data.InsertCounts
 import com.noop.data.StreamBatch
@@ -15,6 +16,7 @@ import com.noop.protocol.decodeHistorical
 import com.noop.protocol.extractHistoricalStreams
 import com.noop.protocol.isEmptyRecordFrame
 import com.noop.protocol.rejectedHistoricalRecords
+import java.io.IOException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -262,6 +264,19 @@ class Backfiller(
         private set
 
     /**
+     * #1992: reject frames still allowed to hex-dump (see [hexDumpAllowance]).
+     *
+     * Deliberately NOT reset in [begin], for the same reason as [lastAckedTrim]: the thing being
+     * protected is the ROLLING LOG, which belongs to the process, not to one offload session. The
+     * auto-continue re-kicks up to 24 sessions per connection, so a per-session budget would allow
+     * 24 x 24 frames and flood the buffer exactly as before, which is the shape the reporter hit.
+     */
+    private var rejectHexBudget: Int = REJECT_HEX_DUMP_BUDGET
+    /** Reject frames seen this session, so the suppression line can say what it stopped showing. */
+    private var rejectFramesSeen: Int = 0
+    private var rejectHexSuppressedNoted: Boolean = false
+
+    /**
      * Distinct historical record-layout versions logged this session. Before this, only the unmapped/
      * reject path surfaced a version, so a HEALTHY log never revealed which layout the strap emits
      * (v24/v25 on 4.0, v18/v26 on 5/MG) — exactly the firmware→layout signal triage needs. Reset in
@@ -275,6 +290,16 @@ class Backfiller(
     /** SpO2 RE dump (PR #945, reimplemented): how many full-record dumps this session emitted, bounded by
      *  [com.noop.analytics.Spo2ReTrace.MAX_SAMPLES]. Session-scoped so the cap spans chunks; reset in begin. */
     private var spo2Dumped = 0
+
+    /** SpO2 RE dump: how many records this session dumped for each layout version, so one layout cannot
+     *  spend the whole session budget. Key -1 buckets a record whose `hist_version` did not decode.
+     *  Session-scoped alongside [spo2Dumped]; reset in begin. Twin of the Swift `spo2DumpedByVersion`. */
+    private val spo2DumpedByVersion = HashMap<Int, Int>()
+
+    /** SpO2 RE dump: records EXAMINED this session, bounded by [com.noop.analytics.Spo2ReTrace.MAX_EXAMINED].
+     *  Counts the decode attempts the search costs, which the dump counter stopped bounding once the
+     *  per-version cap could hold dumps back indefinitely. Reset in begin. Twin of Swift `spo2Examined`. */
+    private var spo2Examined = 0
 
     /**
      * #547: logged once per session the first time the #547 ingest gate drops an implausible-timestamp
@@ -335,6 +360,8 @@ class Backfiller(
         loggedLayoutVersions.clear()
         chunkIndex = 0
         spo2Dumped = 0
+        spo2DumpedByVersion.clear()
+        spo2Examined = 0
         loggedImplausibleClock = false
         sessionDroppedImplausible = 0
         sessionUnhandledPacketTypes.clear()   // #891: a second offload must re-log its first sighting
@@ -454,13 +481,25 @@ class Backfiller(
             // the strap's type-50 console frames carry no record bytes to correlate. Records dump whether
             // or not they carry SpO2 channels, so "nothing banked" is provable too. Never a user-facing
             // number (never-fabricate; the #194 lesson). Twin of the Swift Backfiller emit.
-            if (spo2Dumped < com.noop.analytics.Spo2ReTrace.MAX_SAMPLES && connectionActive()) {
+            if (spo2Dumped < com.noop.analytics.Spo2ReTrace.MAX_SAMPLES &&
+                spo2Examined < com.noop.analytics.Spo2ReTrace.MAX_EXAMINED &&
+                connectionActive()
+            ) {
                 for (f in frames) {
                     if (spo2Dumped >= com.noop.analytics.Spo2ReTrace.MAX_SAMPLES) break
+                    // The decode below is a SECOND decode of a frame the extractor already decoded, so the
+                    // search has to be bounded by what it examines and not only by what it dumps.
+                    if (spo2Examined >= com.noop.analytics.Spo2ReTrace.MAX_EXAMINED) break
+                    spo2Examined++
                     val d = decodeHistorical(f, family) ?: continue
                     // `as? Long`, not `as? Int`: the decoder carries unix in the unsigned domain, so an
                     // Int cast would miss on EVERY record and silently stop the dump. See `histU32`.
                     val recUnix = d["unix"] as? Long ?: continue
+                    // Stratify by layout: without this the first chunk's dominant layout eats the whole
+                    // budget and the rare, still-unmapped one never gets a single frame. See MAX_PER_VERSION.
+                    val ver = d["hist_version"] as? Int ?: -1
+                    val dumpedForVer = spo2DumpedByVersion[ver] ?: 0
+                    if (dumpedForVer >= com.noop.analytics.Spo2ReTrace.MAX_PER_VERSION) continue
                     connectionLog(
                         com.noop.analytics.Spo2ReTrace.recordLine(
                             frame = f,
@@ -471,6 +510,7 @@ class Backfiller(
                             skinRaw = d["skin_temp_raw"] as? Int,
                         ),
                     )
+                    spo2DumpedByVersion[ver] = dumpedForVer + 1
                     spo2Dumped++
                 }
             }
@@ -513,6 +553,13 @@ class Backfiller(
                             "you recognise, this is a firmware record type NOOP has never mapped: please " +
                             "report it on #891 with the strap model and firmware build.",
                     )
+                    // #891: and the bytes, so the report is actionable. Without this the line above asks a
+                    // reporter to raise an issue about a record that exists nowhere else: the else branch
+                    // drops the frame and the reject archive only ever holds type-47. First sighting only,
+                    // so a long offload of one unmapped type still costs exactly one dump.
+                    decoded.unhandledPacketSamples[typeName]?.let { hex ->
+                        log(unmappedTypeDumpLine(typeName, hex))
+                    }
                 }
             }
             // #324: the strap RTC-state events (RTC_LOST / BOOT / SET_RTC) the #547 gate dropped for a bad
@@ -552,7 +599,10 @@ class Backfiller(
                 // records run ~84 B and the truncated tail is exactly where the unmapped motion/HR
                 // fields sit), and sample a few more so one log carries enough records to triangulate
                 // offsets. These only ever fire for unmapped firmware.
-                val sample = rejected.take(8)
+                rejectFramesSeen += rejected.size
+                // #1992: spend from a SESSION budget, not a fresh 8 per chunk. See [hexDumpAllowance].
+                val allowance = hexDumpAllowance(rejected.size, rejectHexBudget)
+                val sample = rejected.take(allowance)
                 var emptySkipped = 0
                 sample.forEachIndexed { i, f ->
                     // #1007: an all-zero frame has no record layout to map, so its hex dump is pure log
@@ -560,9 +610,20 @@ class Backfiller(
                     if (isEmptyRecordFrame(f)) { emptySkipped++; return@forEachIndexed }
                     val hex = f.joinToString("") { "%02x".format(it) }
                     log("Backfill: rejected frame[$i] ${f.size}B: $hex")
+                    rejectHexBudget--
                 }
                 if (emptySkipped > 0) {
                     log("Backfill: #1007 $emptySkipped/${sample.size} sampled frame(s) all-zero (empty payload) - hex dump skipped")
+                }
+                // Say ONCE that the sample is capped, so a reader knows the dump is a sample rather than
+                // everything the strap sent, and where the rest lives.
+                if (rejectHexBudget <= 0 && !rejectHexSuppressedNoted) {
+                    rejectHexSuppressedNoted = true
+                    log(
+                        "Backfill: hex dumps capped at $REJECT_HEX_DUMP_BUDGET frame(s) while this connection lasts " +
+                            "($rejectFramesSeen reject frame(s) seen so far); the complete records are in the " +
+                            "reject archive. Sample is enough to map a layout (#1992)",
+                    )
                 }
             }
             // Commit the decoded rows FIRST (durable) — BEFORE the reject archive (#1006, matching the
@@ -719,6 +780,38 @@ class Backfiller(
     }
 
     companion object {
+        /**
+         * Reject frames one connection may hex-dump (#1992). Three chunks worth at the per-chunk
+         * cap: enough distinct records to triangulate field offsets (v25 was mapped from 45, spread
+         * across many logs), while leaving room in a 2000-line rolling buffer for the lines that
+         * give the dump its context. The complete records are always in the reject archive.
+         */
+        internal const val REJECT_HEX_DUMP_BUDGET = 24
+
+        /**
+         * #891: the dump line for the first frame of an unmapped packet type. Byte-identical to the Swift
+         * `Backfiller.unmappedTypeDumpLine`; [hex] is the FULL frame, so the length is derived from it
+         * rather than passed separately and able to disagree with the bytes beside it.
+         */
+        internal fun unmappedTypeDumpLine(typeName: String, hex: String): String =
+            "Backfill: unmapped type $typeName first frame ${hex.length / 2}B: $hex"
+
+        /**
+         * How many reject frames this chunk may hex-dump, given what the session has already spent (#1992).
+         *
+         * The dump is the only channel carrying an unmapped layout's raw bytes to someone who can map it,
+         * and it was bounded PER CHUNK with no session budget. On the straps it exists for that defeats
+         * itself: a strap rejecting ~25 records per chunk, across many chunks and many sessions per
+         * connection, emits 8 long hex lines each time, floods the 2000-line rolling log, and evicts its own
+         * earlier dumps along with the context needed to read them. A session budget keeps a usable sample
+         * rather than a flood that rolls itself away.
+         *
+         * Pure, so the arithmetic is testable without constructing a Backfiller (which needs a repository
+         * over a 152-method DAO). Swift twin: `hexDumpAllowance`.
+         */
+        internal fun hexDumpAllowance(rejectedCount: Int, budgetRemaining: Int, perChunkCap: Int = 8): Int =
+            maxOf(0, minOf(rejectedCount, perChunkCap, budgetRemaining))
+
         /** Cursor name for the strap's safe-trim watermark. Matches the Swift `setCursor("strap_trim", ...)`. */
         const val STRAP_TRIM_CURSOR = "strap_trim"
 
@@ -934,13 +1027,22 @@ interface TrimCursorStore {
 }
 
 /** Default [TrimCursorStore] backed by a private SharedPreferences file. */
-class PrefsTrimCursorStore(context: Context) : TrimCursorStore {
-    private val prefs = context.applicationContext
-        .getSharedPreferences("noop_backfill_cursors", Context.MODE_PRIVATE)
+class PrefsTrimCursorStore(private val prefs: SharedPreferences) : TrimCursorStore {
+
+    /** Production entry point: the app's private cursor prefs file. */
+    constructor(context: Context) : this(
+        context.applicationContext.getSharedPreferences("noop_backfill_cursors", Context.MODE_PRIVATE),
+    )
 
     override suspend fun set(name: String, value: Long) {
         // commit() (synchronous) so durability is established before we ack the strap.
-        prefs.edit().putLong(name, value).commit()
+        // #8: commit() reports a FAILED write (full storage, unwritable prefs file) by RETURNING
+        // false — it does not throw. Discarding that result made a failed persist look identical to
+        // a successful one, so the caller's try/catch never fired and the strap got acked without a
+        // durable cursor. Surface it as the throw that guard already handles by HOLDING the ack.
+        if (!prefs.edit().putLong(name, value).commit()) {
+            throw IOException("SharedPreferences.commit() returned false for cursor '$name'=$value")
+        }
     }
 
     override suspend fun get(name: String): Long? =
