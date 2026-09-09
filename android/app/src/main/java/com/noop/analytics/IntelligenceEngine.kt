@@ -99,6 +99,23 @@ object IntelligenceEngine {
     private var dayScanCache = HashMap<String, CachedDayScan>()
     private var dayScanCacheConfigSig = ""
 
+    /** Whether this process has already seeded [stepsMotionCache] from the persisted payload. The read
+     *  happens once per process, not once per pass: after the first pass the in-memory cache is at least as
+     *  fresh as the payload, so re-reading it could only ever put back what the pass just pruned. Latched
+     *  only when a store was actually consulted, so a caller that does not wire one cannot silently spend
+     *  the single load on nothing and leave the rest of the process unpersisted. */
+    private var stepsMotionCacheLoaded = false
+
+    /** The payload currently in the store, so an unchanged cache does not rewrite it. A pass that reused
+     *  every day renders the string it read, and those passes are the back-to-back ones an offload storm is
+     *  made of. Not an assumption about what the store does with an identical value: it is not asked. */
+    private var stepsMotionCachePersisted = ""
+
+    /** Per-day steps-calibration motion folds, `day -> (key, motion)`, keyed by [StepsMotionCache.cacheKey].
+     *  In-memory and per-process exactly like [dayScanCache]; see [StepsMotionCache] for why this one needs no
+     *  config signature. Pruned to the calibration window each pass so it cannot grow without bound. */
+    private var stepsMotionCache = HashMap<String, Pair<String, Double>>()
+
     /** One reused night: its per-day cache [key], the scored [res], and everything the pass-1 loop otherwise
      *  writes into function-scoped per-day maps that pass 2 reads (owner/hrRows/primary-session RHR/SpO₂
      *  candidate/HRV over-count), plus the always-on per-day [diagLines] to replay so a reused pass logs the
@@ -190,6 +207,33 @@ object IntelligenceEngine {
     /** CAPTURE-B: a day's resolved read owner + the HR-row count read for it, captured in pass 1 and
      *  consumed by pass 2's universal dayOwner emit. */
     private data class OwnerRead(val owner: String, val hrRows: Int)
+
+    /**
+     * #2013: the census beside `re-score: done`, saying what the pass is carrying rather than how many
+     * nights it visited.
+     *
+     * A day that is scored but comes back with a null metric vanishes from that metric's detail screen
+     * without a word, and the reported case looked identical to a day that was never scored at all. The
+     * split between "the pass never produced it" and "the pass produced it and it was lost downstream" is
+     * the first question in that investigation and the log could not answer it.
+     *
+     * This counts what the pass PRODUCED, taken from its own DayResult rather than from a stored row, so
+     * it answers one half of the split. If a metric matches the night count and days are still absent
+     * from the screen, the loss is downstream of here and wants its own line at the write. That is the
+     * useful outcome either way: it says which half to look in, which is what #2013 lacked.
+     *
+     * Pure so the wording is pinned without running a pass. Names the day SPAN too, since a window that
+     * quietly shrank is the other way days go missing.
+     */
+    internal fun reScoreCensusLine(scored: List<Computed>): String {
+        if (scored.isEmpty()) return "re-score census: 0 night(s), nothing to carry"
+        val days = scored.map { it.day }.sorted()
+        return "re-score census: ${scored.size} night(s) ${days.first()}..${days.last()} " +
+            "charge=${scored.count { it.recovery != null }} effort=${scored.count { it.strain != null }} " +
+            "sleep=${scored.count { it.sleepMin != null }} hrv=${scored.count { it.hrv != null }} " +
+            "rhr=${scored.count { it.rhr != null }} (a metric short of the night count is one the pass " +
+            "produced nothing for)"
+    }
 
     /** Summary of one scored day (for logging / a future on-device intelligence screen). */
     data class Computed(
@@ -429,6 +473,13 @@ object IntelligenceEngine {
         // and passes it down, keeping this layer Context-free. EDWARDS default = byte-identical.
         effortMethod: StrainScorer.Method = StrainScorer.Method.EDWARDS,
         dayCycleMode: DayCycleMode = DayCycleMode.SLEEP_ONSET,
+        // Persisted backing for [stepsMotionCache]. Context-free like the rest of this layer, mirroring
+        // manualStepCoefficient / persistStepsCalibration above: the Context-aware caller (AppViewModel)
+        // reads and writes SharedPreferences and passes the accessors down. The defaults are no-ops, so a
+        // caller that does not wire them keeps exactly today's per-process-only behaviour, which is what
+        // every existing test relies on. Read/written under [analyzeGate] with the cache they back.
+        stepsMotionCacheGet: (() -> String?)? = null,
+        stepsMotionCacheSet: ((String) -> Unit)? = null,
     ): List<Computed> = withContext(Dispatchers.Default) {
         // #1005: time the whole pass so a re-score STORM is visible in the strap log (the trigger lines
         // record WHY each pass runs; this records how many nights and how long — the CPU cost per run).
@@ -437,12 +488,31 @@ object IntelligenceEngine {
         // [analyzeGate]). The heavy scoring already ran off the caller's thread via withContext above; the
         // lock is held only for this engine's own passes, never across an unrelated suspension.
         val scored = analyzeGate.withLock {
+            // Seed the fold cache from storage on the first pass of the process. Without this the sixty-day
+            // fold is re-paid in full after every relaunch — the cache's whole win is a repeat, and a
+            // relaunch is a repeat the process boundary hid. Nothing pass-global feeds the fold, so a
+            // payload written by a previous launch is as good as one written by the previous pass; see
+            // [StepsMotionCache]. Inside the lock because it writes the gate-guarded cache.
+            // Zero the per-day probe counters so the line below describes THIS pass and never accumulates
+            // across the back-to-back passes an offload storm is made of. Reset and emit both live in this
+            // wrapper, never in `analyzeRecentOnCpu`, whose ratchet margin has no room for either.
+            StoreProbeTally.reset()
+            if (!stepsMotionCacheLoaded && stepsMotionCacheGet != null) {
+                stepsMotionCacheLoaded = true
+                val raw = stepsMotionCacheGet()
+                if (raw != null) {
+                    stepsMotionCache = StepsMotionCache.deserialize(raw)
+                    // Seed the write guard with what is actually stored. A payload this build renders
+                    // identically then costs no write; one carrying a line we dropped is rewritten clean.
+                    stepsMotionCachePersisted = raw
+                }
+            }
             val (out, healed) = analyzeRecentOnCpu(repo, profile, maxDays, importedDeviceId, maxHROverride,
                 nowSeconds, ownerSource, manualStepCoefficient, persistStepsCalibration, baselineEpoch,
                 recoveryEpoch, diag, useExperimentalSleepV2, useMotionAwareWake, sleepTraceSink, recoveryTraceSink,
                 stepsTraceSink, universalSink, workoutsTraceSink, hrvTraceSink, deepHrvWindow,
                 spo2CandidateDisplay, effortMethod, dayCycleMode)
-            if (healed == 0) out
+            val result = if (healed == 0) out
             // #899 heal re-pass: the pass above deleted overlapping duplicate sleep sessions AFTER its days
             // were scored, and the read-side dedup those days consumed had no bank-recency witness (the fresh
             // detections weren't banked yet), so its survivor can differ from the heal's. ONE bounded re-pass
@@ -453,8 +523,27 @@ object IntelligenceEngine {
                 recoveryEpoch, diag, useExperimentalSleepV2, useMotionAwareWake, sleepTraceSink, recoveryTraceSink,
                 stepsTraceSink, universalSink, workoutsTraceSink, hrvTraceSink, deepHrvWindow,
                 spo2CandidateDisplay, effortMethod, dayCycleMode).first
+            // Write the pruned cache back, after the heal re-pass so the payload reflects whichever pass ran
+            // last, and only when it moved. `serialize` renders sorted, so a pass that reused every day
+            // produces the string already stored and skips the write entirely.
+            if (stepsMotionCacheSet != null) {
+                val payload = StepsMotionCache.serialize(stepsMotionCache)
+                if (payload != stepsMotionCachePersisted) {
+                    stepsMotionCachePersisted = payload
+                    stepsMotionCacheSet(payload)
+                }
+            }
+            // What the pass spent on its per-day probe queries, beside the `stepsMotion reused=N/M` line.
+            // Together they say whether a warm pass that folded nothing still went into the round trips.
+            diag(StoreProbeTally.line())
+            result
         }
         diag("re-score: done — scored ${scored.size} night(s) in ${(System.nanoTime() - reScoreStart) / 1_000_000} ms (#1005)")
+        // #2013: what the pass actually CARRIES, beside how many nights it touched. "scored N nights" is
+        // silent about a day that was scored and came back empty, which is exactly the shape reported: the
+        // detail screen omitted days the log showed being scored, and nothing in between said which half
+        // lost them. A census of the results makes that answerable from one shared log.
+        diag(reScoreCensusLine(scored))
         scored
     }
 
@@ -1971,6 +2060,11 @@ object IntelligenceEngine {
         persistStepsCalibration: (StepsEstimateEngine.Calibration) -> Unit,
         stepsTraceSink: ((String) -> Unit)?,
     ) {
+        // #1538: the pass after the day loop was never measured — the cost line brackets the day loop and is
+        // emitted the moment it returns, so the steps calibration re-folding sixty days of gravity every pass
+        // sat outside every number the pass printed. This brackets the two phases inside THIS helper; see
+        // AnalysisPhaseMarks for why Android stops here and Swift does not.
+        val postLoop = AnalysisPhaseMarks()
         // ── Fitness Age (Phase 2) , weekly, keyed to the week's Saturday ──
         val fa7 = dailies.sortedBy { it.day }.takeLast(7)
         val faRHRs = fa7.mapNotNull { it.restingHr }.map { it.toDouble() }
@@ -2017,6 +2111,7 @@ object IntelligenceEngine {
                 MetricSeriesRow(deviceId = computedId, day = satKey, key = "body_age", value = vRes.bodyAge)))
         }
 
+        postLoop.mark("weekly")
         // ── Steps ESTIMATE (WHOOP 4.0) , DAILY, keyed to each strap-only day ──
         // A WHOOP 4.0 sends no step count over BLE, so for days the phone DIDN'T also count steps we
         // estimate them: calibrate the strap's daily MOTION VOLUME against the phone's real step count on
@@ -2047,16 +2142,51 @@ object IntelligenceEngine {
         }
         // Per-day motion volume over the calibration window, read from the owner-resolved strap streams.
         // (Owner resolution mirrors the scoring loop; a single-device install resolves to importedDeviceId.)
+        //
+        // Each day is re-folded only when its own gravity witness moved. The fold is pure over that one
+        // stream, so an unchanged witness means an unchanged volume — see [StepsMotionCache]. The fingerprint
+        // is a COUNT/MAX aggregate over the same (deviceId, ts) index the read walks, so a hit replaces a
+        // read capped at STREAM_LIMIT rows with one that returns a single row.
         val motionByDay = HashMap<String, Double>()
+        var motionReused = 0
+        var motionFolded = 0
+        val motionWindow = HashSet<String>()
         for (off in 0 until stepsCalDays) {
             val dayMid = midnightLocal(nowLocalMidnight - off * SECONDS_PER_DAY, tzOffsetSeconds)
             val dayEnd = dayMid + SECONDS_PER_DAY - 1
             val dayKey = AnalyticsEngine.dayString(dayMid, tzOffsetSeconds)
+            motionWindow.add(dayKey)
             val owner = resolveDayOwner(repo, ownerSource, candidatePriorities, dayKey, dayMid, dayEnd, importedDeviceId)
-            val grav = repo.gravitySamplesForDevice(owner, dayMid, dayEnd, STREAM_LIMIT)
-            val m = StepsEstimateEngine.dayMotionIntensity(grav)
+            // Unlike the Swift twin there is no soft-failure branch here, and that is deliberate rather
+            // than an omission. Swift's store reads throw and this whole block wraps them in `try?`, so it
+            // has to say what a read it could not make means: a witness it cannot read bypasses the cache
+            // in both directions, and a zero fold from a FAILED read is not cached. Kotlin's repo reads
+            // propagate, so a failure aborts the pass before anything is written, which reaches the same
+            // place by a shorter route. Adding a catch here would not add safety; it would swallow an
+            // abort and start caching zeros that only mean "we could not look".
+            val fp = repo.gravityFingerprintWindow(owner, dayMid, dayEnd)
+            val key = StepsMotionCache.cacheKey(owner, fp.first, fp.second)
+            val cached = stepsMotionCache[dayKey]
+            val m: Double
+            if (cached != null && cached.first == key) {
+                m = cached.second
+                motionReused++
+            } else {
+                val grav = repo.gravitySamplesForDevice(owner, dayMid, dayEnd, STREAM_LIMIT)
+                m = StepsEstimateEngine.dayMotionIntensity(grav)
+                motionFolded++
+                // A ZERO fold is cached too. Storing only the days that moved would leave every unworn gap
+                // re-reading its whole stream on every pass to rediscover that it is empty, which is most of
+                // the window on exactly the sparse libraries this is worst for.
+                stepsMotionCache[dayKey] = key to m
+            }
+            // Unchanged: only a positive volume becomes a calibration/estimation input. The cache holds the
+            // fold, this holds the filter, so [motionByDay] is byte-identical to the old loop's — and #1816's
+            // stepsHasMotionSink, which reads its emptiness, is untouched.
             if (m > 0) motionByDay[dayKey] = m
         }
+        stepsMotionCache.keys.retainAll(motionWindow)
+        diag(StepsMotionCache.logLine(motionReused, motionFolded, stepsMotionCache.size))
         // #1816: persist whether the strap banked ANY motion in the calibration scan window, so the Today
         // tile can distinguish "Need N more phone-step days" (motion exists, phone half missing) from
         // "No motion synced yet" (the motion half is the blocker, and no number of phone-step days will
@@ -2101,6 +2231,8 @@ object IntelligenceEngine {
                 }
             }
         }
+        postLoop.mark("steps")
+        diag(AnalysisPhaseTally.logLine("persistSteps", postLoop.phases))
     }
 
     /**
@@ -2657,13 +2789,21 @@ object IntelligenceEngine {
         if (candidatePriorities.size == 1 && candidatePriorities.first().first == importedDeviceId) {
             return importedDeviceId
         }
-        val candidates = candidatePriorities.map { (id, priority) ->
-            // Cheap presence check: a single HR row for this device in the night window marks it a
-            // candidate. (LIMIT 1 , not the full pull the caller does once an owner is chosen.)
-            val hasData = repo.hrSamplesForDevice(id, from, to, 1).isNotEmpty()
-            DayOwnerResolver.Candidate(deviceId = id, priority = priority, hasData = hasData)
+        // Probe in PRIORITY ORDER and stop at the first candidate that has data.
+        //
+        // [DayOwnerResolver.resolve] is `candidates.filter { hasData }.minByOrNull { priority }`, so the
+        // winner is the lowest-priority-number candidate with data, and every probe after that one cannot
+        // change the answer. Probing them anyway cost a query per candidate per day: on the 60-day steps
+        // window with two straps that is 120 per pass, and the active strap usually answers on the first.
+        // `DayOwnerResolverEquivalenceTest` pins this against the resolver itself rather than trusting
+        // the reasoning, because the two must not be allowed to drift.
+        //
+        // The probe is a scalar EXISTS now, not a fetched LIMIT 1 row: the question is one bit, and it
+        // used to be answered by materialising a cursor and an HrSample to test a list for emptiness.
+        for ((id, _) in candidatePriorities.sortedBy { it.second }) {
+            if (repo.hasHrInWindow(id, from, to)) return id
         }
-        return DayOwnerResolver.resolve(day, lockedOwner = null, candidates = candidates) ?: importedDeviceId
+        return importedDeviceId
     }
 
     /**
