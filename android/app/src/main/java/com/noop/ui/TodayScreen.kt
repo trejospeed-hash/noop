@@ -164,6 +164,9 @@ import com.noop.analytics.StepsEstimateEngine
 import com.noop.analytics.StrainScorer
 import com.noop.ble.WhoopModel
 import com.noop.data.DailyMetric
+import com.noop.protocol.Whoop5RR
+import com.noop.widget.StressPoint
+import com.noop.widget.StressWidgetProducer
 import com.noop.data.HrBucket
 import com.noop.data.SleepSession
 import com.noop.data.WhoopRepository
@@ -1083,6 +1086,51 @@ fun TodayScreen(
         }
     }
 
+    // #1505: whether this strap's R-R is read under the WHOOP 5 single-transport unit policy, plus the
+    // two local days that bound the era it could not score: the first day it banked ANY beat, and the
+    // first day it banked a scorable one (null when it has banked none). Three cheap reads (a registry
+    // row, two indexed MINs), keyed on `days` so a sync that lands labelled beats moves the scorable day
+    // instead of leaving a stale one telling a wearer last night could not be scored.
+    // A read that throws leaves the flag off, which HIDES the note rather than showing a guessed one.
+    var whoop5StrictRr by remember { mutableStateOf(false) }
+    var firstRecordedRrDay by remember { mutableStateOf<String?>(null) }
+    var firstScorableRrDay by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(days) {
+        runCatching {
+            // The ACTIVE strap, the id every other read on this screen threads. A re-pair leaves history
+            // under the canonical alias, and the repository's own policy resolves that; asking about the
+            // alias here would answer for whichever strap it inherited from.
+            val owner = viewModel.activeStrapId
+            // The plain local calendar date, which is the convention every banked `day` key on this
+            // screen uses (`selectedDay.toString()`), NOT the 04:00 logical-day remap: these compare
+            // against row keys, and remapping them would shift the boundary by a few hours.
+            fun dayKey(ts: Long?) =
+                ts?.let { LocalDate.ofInstant(Instant.ofEpochSecond(it), ZoneId.systemDefault()).toString() }
+            whoop5StrictRr = viewModel.repo.isWhoop5RrSource(owner)
+            firstRecordedRrDay = dayKey(viewModel.repo.firstRecordedRrTs(owner))
+            firstScorableRrDay = dayKey(viewModel.repo.firstScorableWhoop5RrTs(owner))
+        }.onFailure {
+            whoop5StrictRr = false
+            firstRecordedRrDay = null
+            firstScorableRrDay = null
+        }
+    }
+
+    // #1505: whether the SELECTED day's empty Charge is explained by the unit policy having no scorable
+    // beats for that night. The judgement is the pure `Whoop5RR.legacyUnscorableNight`, shared byte for
+    // byte with iOS; everything it reads is already on the row or loaded above.
+    val chargeLegacyRrGap = remember(displayMetric, whoop5StrictRr, firstRecordedRrDay, firstScorableRrDay) {
+        val row = displayMetric
+        row != null && row.recovery == null && Whoop5RR.legacyUnscorableNight(
+            strictWhoop5 = whoop5StrictRr,
+            day = row.day,
+            firstRecordedDay = firstRecordedRrDay,
+            firstScorableDay = firstScorableRrDay,
+            avgHrv = row.avgHrv,
+            totalSleepMin = row.totalSleepMin,
+        )
+    }
+
     // Explainability (COMPONENT 2): the honest state of the score side for TODAY, scored / calibrating /
     // carried-last-night / needs-strap. One state, never a bare blank, and never a fabricated number. Only
     // computed for today (offset 0); a past day shows its own row, not a "needs the strap" prompt.
@@ -1359,8 +1407,15 @@ fun TodayScreen(
             // the hero with NO in-ring caption, so its "Last night ..." note renders BELOW the rings here,
             // matching iOS explainedScoreNote. Today only; never a fabricated value.
             //
-            // #827: NeedsStrap ALWAYS shows (a today-blocking state, not a recurring nag).
-            if (selectedDayOffset == 0 && scoreState is ScoreState.NeedsStrap) {
+            // #1505: a night whose beats predate transport labelling has a known, specific cause, so it
+            // is named instead of leaving a bare blank. Checked BEFORE the generic states and on EVERY
+            // day, not just today: unlike an ordinary missing-data gap the cause is known, so a past day
+            // gets the same honest explanation, and that is where this is almost always read.
+            if (chargeLegacyRrGap) {
+                ChargeLegacyRrGapNote()
+            // #827: NeedsStrap ALWAYS shows (a today-blocking state, not a recurring nag), except behind
+            // the #1505 note above, which names the SAME blank's actual cause rather than restating it.
+            } else if (selectedDayOffset == 0 && scoreState is ScoreState.NeedsStrap) {
                 ScoreStateNote(scoreState)
             }
             // The carried "Latest sleep · <date>" / "Last night · <date>" note. iOS has NOTHING in this slot,
@@ -1730,6 +1785,10 @@ fun TodayScreen(
                         // #today-hosted-cards: the Trends/Sleep cards the user pulled into Today, in
                         // arranged order. Each is the SAME card its home tab renders (a mirror).
                         TodaySection.ADDED_CARDS -> HostedCardsSection(
+                            effortScale = effortScale,
+                            onOpenStress = onOpenStress,
+                            onOpenSleep = onOpenSleep,
+                            onOpenMetric = onOpenMetric,
                             cards = enabledHostedCards,
                             days = days,
                             viewModel = viewModel,
@@ -3470,7 +3529,18 @@ private fun TodayEditAction(
  * confirmation toast). Renders nothing when [cards] is empty. Twin of the iOS `hostedCardsSection`.
  */
 @Composable
-private fun HostedCardsSection(cards: List<HostedCard>, days: List<DailyMetric>, viewModel: AppViewModel) {
+private fun HostedCardsSection(
+    cards: List<HostedCard>,
+    days: List<DailyMetric>,
+    viewModel: AppViewModel,
+    // Passed in rather than read here: Today already resolved it once for its own tiles, and reading
+    // SharedPreferences per hosted card per recomposition would put a synchronous file read on the
+    // composition path of a screen that recomposes often.
+    effortScale: EffortScale,
+    onOpenStress: () -> Unit,
+    onOpenSleep: () -> Unit,
+    onOpenMetric: (String) -> Unit,
+) {
     if (cards.isEmpty()) return
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -3488,9 +3558,49 @@ private fun HostedCardsSection(cards: List<HostedCard>, days: List<DailyMetric>,
             null
         }
     }
+    // Today's stress curve, loaded only when the card is actually hosted — the same "hosting none pays
+    // nothing" rule the sleep model above follows. Routed through the SAME gated producer the stress
+    // widget publishes from, so hosting this card costs one indexed COUNT on an unchanged day and the
+    // card and the widget can never show different curves.
+    val needsStressCurve = cards.contains(HostedCard.STRESS_TODAY)
+    var stressCurve by remember { mutableStateOf<List<StressPoint>>(emptyList()) }
+    LaunchedEffect(needsStressCurve, days, viewModel.activeStrapId) {
+        stressCurve = if (needsStressCurve) {
+            StressWidgetProducer.todayCurve(viewModel.repo, viewModel.activeStrapId)?.points ?: emptyList()
+        } else {
+            emptyList()
+        }
+    }
+    // Turning the card's own destination into the callback that reaches it. The mapping itself lives
+    // on `HostedCard` so a test can assert it; this is only the wiring, which cannot be tested and does
+    // not need to be.
+    fun opener(card: HostedCard): (() -> Unit)? = when (val d = card.destination) {
+        HostedDestination.None -> null
+        HostedDestination.Sleep -> onOpenSleep
+        HostedDestination.Stress -> onOpenStress
+        is HostedDestination.Metric -> ({ onOpenMetric(d.key) })
+    }
+
     Column(verticalArrangement = Arrangement.spacedBy(Metrics.sectionGap)) {
         cards.forEach { card ->
+            val open = opener(card)
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    // Clipped to the card's own radius BEFORE the click. `NoopCard` clips itself, but
+                    // the ripple draws on this wrapper, so without matching the shape here it would wash
+                    // square corners over a rounded card. `Metrics.cardRadius` is the right figure
+                    // because every hosted card renders through `NoopCard`: the 26dp liquid-hero
+                    // surface `ChartCard` can wear is hero-only, and none of these opt into it.
+                    .clip(RoundedCornerShape(Metrics.cardRadius))
+                    .then(if (open != null) Modifier.clickable(onClick = open) else Modifier),
+            ) {
             when (card) {
+                HostedCard.STRESS_TODAY -> StressTodayCard(stressCurve)
+                // The Trends-origin trends. `resolveMetric` walks the `days` already in hand, so these
+                // need no model build and no gate, unlike the sleep and stress cards above.
+                HostedCard.TREND_HRV, HostedCard.TREND_RESTING_HR, HostedCard.TREND_EFFORT ->
+                    TrendHostCard(card, days, effortScale)
                 HostedCard.SLEEP_MARKS -> SleepMarkCard(
                     onMark = { type ->
                         val mark = SleepMark.now(type)
@@ -3538,6 +3648,7 @@ private fun HostedCardsSection(cards: List<HostedCard>, days: List<DailyMetric>,
                 // ConsistencyHostCard. Null until the async build lands / no stage data — the slot renders
                 // nothing this frame, matching the Sleep tab's null-model guard.
                 HostedCard.CONSISTENCY -> hostedSleepModel?.let { ConsistencyHostCard(it) }
+            }
             }
         }
     }
@@ -5056,7 +5167,7 @@ private fun RecoveryContributorsSection(day: DailyMetric?, carriedDay: DailyMetr
             )
             Text(
                 uiString(R.string.l10n_today_screen_baselines_learned_on_device_over_14_359f6812) +
-                    "signal against a typical adult range, not medical advice.",
+                    " signal against a typical adult range, not medical advice.",
                 style = NoopType.footnote,
                 color = Palette.textTertiary,
             )
@@ -5181,6 +5292,40 @@ private fun ScoreStateNote(state: ScoreState, restartCause: String? = null) {
                 restartCause?.let {
                     Text(it, style = NoopType.footnote, color = Palette.textTertiary)
                 }
+            }
+        }
+    }
+}
+
+/** #1505: the note shown instead of a bare blank when the selected night's beats predate WHOOP 5
+ *  transport labelling and so cannot be scored. Same card shape as [ScoreStateNote] it sits beside.
+ *  Twin of the iOS `chargeLegacyRRGapNote`. */
+@Composable
+private fun ChargeLegacyRrGapNote() {
+    val title = uiString(R.string.charge_legacy_rr_gap_title)
+    val detail = uiString(R.string.charge_legacy_rr_gap_detail)
+    // Resolved before the Row: `semantics { }` is not a composable scope, so uiString cannot be called
+    // inside it, and reading them once keeps the card and its a11y label on one string.
+    val noteA11y = uiString(R.string.l10n_today_screen_state_title_state_detail_f5380609, title, detail)
+    NoopCard {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .semantics { contentDescription = noteA11y },
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.Top,
+        ) {
+            Icon(
+                Icons.Filled.MonitorHeart,
+                contentDescription = null,
+                tint = Palette.chargeColor,
+                modifier = Modifier
+                    .padding(top = 1.dp)
+                    .size(Metrics.iconSmall),
+            )
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(title, style = NoopType.headline, color = Palette.textPrimary)
+                Text(detail, style = NoopType.subhead, color = Palette.textSecondary)
             }
         }
     }
@@ -5852,6 +5997,16 @@ private fun HrWindowPills(selection: HrWindow, onSelect: (HrWindow) -> Unit) {
     )
 }
 
+/** The width of the Today HR card's buckets.
+ *
+ *  ONE literal, read by the load below and by the gap test in [OverviewHRChart]. They have to agree:
+ *  [hrGapSegmentIds] calls any step wider than one bucket a gap, so a load widened to 600 against a
+ *  test still holding 300 would call EVERY step a gap and shatter the line into dots. The codebase
+ *  genuinely runs 60, 300, 3600 and a span-derived width for other charts, so the two drifting apart is
+ *  a live possibility rather than a theoretical one.
+ */
+internal const val HR_CARD_BUCKET_SECONDS = 300L
+
 @Composable
 private fun HeartRateTrendCard(
     viewModel: AppViewModel,
@@ -5918,7 +6073,9 @@ private fun HeartRateTrendCard(
         // #908: the Today HR curve reads the active strap ∪ canonical "my-whoop" union, NOT a hardcoded
         // "my-whoop". A strap re-added via the device manager banks live HR under its own fresh id, so a
         // pinned read showed the "no heart rate banked yet today" empty state. Single-WHOOP ⇒ one id ⇒ same.
-        buckets = viewModel.repo.hrBucketsUnion(viewModel.activeStrapId, start, end, 300L)
+        buckets = viewModel.repo.hrBucketsUnion(
+            viewModel.activeStrapId, start, end, HR_CARD_BUCKET_SECONDS,
+        )
         // The sleep that ended within the chart window (the night before / this morning), anchors
         // the band + the Charge-at-wake marker. A wide lower bound catches an onset before midnight.
         // Resolves the day's bridged MAIN-night span via `mainSleepSpan` (the SAME resolver the Sleep
@@ -5997,8 +6154,13 @@ private fun HeartRateTrendCard(
     // TODAY that is the identical full-buckets list, so the default path is byte-for-byte the old one.
     val bpm = remember(winBuckets) { winBuckets.map { it.avgBpm } }
     val latest = bpm.last().roundToInt()
-    val min = bpm.min().roundToInt()
-    val max = bpm.max().roundToInt()
+    // #2032: the Min/Max READOUT reads the samples, not the mean curve. Taken from `bpm` these described
+    // the calmest and busiest five minutes, so a hard interval read lower here than in the workout that
+    // contained it, and the resting dip read higher than it was. The y-rail below stays on the means,
+    // because that is the series it labels: raw extremes there would squash the drawn curve into the
+    // middle of its own axis. Avg is left on the means deliberately, see the PR.
+    val min = remember(winBuckets) { winBuckets.minOf { it.minBpm } }.roundToInt()
+    val max = remember(winBuckets) { winBuckets.maxOf { it.maxBpm } }.roundToInt()
     val avg = bpm.average().roundToInt()
 
     // #829 - the RENDERED subset: the zoom window narrows which of the loaded buckets draw (the gesture
@@ -6332,6 +6494,9 @@ private fun OverviewHRChart(
 ) {
     // The line itself stays the existing shared component, unchanged, markers are a sibling overlay.
     val bucketTimestamps = remember(buckets) { buckets.map { it.bucket } }
+    val gapSegments = remember(bucketTimestamps) {
+        hrGapSegmentIds(bucketTimestamps, HR_CARD_BUCKET_SECONDS)
+    }
     val minV = bpm.min()
     val maxV = bpm.max()
     val span = (maxV - minV).takeIf { it > 0.0 } ?: 1.0
@@ -6459,6 +6624,9 @@ private fun OverviewHRChart(
             // formatter carries the unit — "14:32 · 87 bpm" instead of a bare "87".
             formatValue = { "${it.roundToInt()} bpm" },
             timestamps = bucketTimestamps,
+            // A bucket with no samples is absent from the aggregate, so without this the stroke joins
+            // the two neighbours and draws a steady climb across hours the strap recorded nothing.
+            segmentIds = gapSegments,
         )
 
         // 2) Wake divider + dashed rules + glow end-cap, drawn in one Canvas ON TOP of the line.
