@@ -1385,6 +1385,8 @@
     <string name="l10n_components_glowring_value_ac0e87de">Glühwert</string>
     <string name="l10n_components_increase_accessibility_0949c0e9">%1$s erhöhen</string>
     <string name="l10n_components_ringfill_59cd4fb9">ringFill</string>
+    <string name="l10n_components_close_bbfa773e">Schließen</string>
+    <string name="l10n_components_copy_af74f7c5">Kopieren</string>
     <string name="l10n_connection_help_allow_nearby_devices_f7c74880">Geräte in der Nähe zulassen</string>
     <string name="l10n_connection_help_charge_it_and_put_it_on_31b04814">Lade es und lege es auf</string>
     <string name="l10n_connection_help_close_the_official_whoop_app_768d7d17">Schließe die offizielle WHOOP App</string>
@@ -1970,6 +1972,7 @@
     <string name="recording_chip_detail_history_experimental">Verlaufssynchronisierung ist auf 5.0 experimentell.</string>
     <string name="recording_chip_detail_connected_no_data">Noch keine Live-Herzfrequenz und kein synchronisierter Verlauf in dieser Sitzung.</string>
     <string name="score_state_title_calibrating">Kalibrierung</string>
+    <string name="l10n_stress_glance_widget_resumes_in_the_morning_a640b49f">Wird morgens fortgesetzt</string>
     <string name="score_state_title_needs_strap">Strap erforderlich</string>
     <string name="score_state_title_last_night">Letzte Nacht · %1$s</string>
     <string name="score_state_title_latest_sleep">Letzter Schlaf · %1$s</string>
@@ -2770,4 +2773,5 @@
     <string name="coach_key_rejected_action">Schlüssel aktualisieren</string>
     <string name="coach_consent_on">An: Ladung, Erholung, HRV und Workouts gehen an den Anbieter, jedes Workout mit Sportart, Dauer, Distanz und Herzfrequenz.</string>
     <string name="coach_consent_off">Aus: Der Coach antwortet allgemein und sendet keine deiner Werte.</string>
+    <string name="l10n_app_changelog_a_today_screen_you_arrange_yourself_6194ccd0">Ein Heute-Bildschirm, den du selbst zusammenstellst, Stress auf dem Homescreen und Backups, die sich selbst prüfen</string>
 </resources>

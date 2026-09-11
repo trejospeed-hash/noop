@@ -1203,6 +1203,8 @@
     <string name="l10n_components_glowring_value_ac0e87de">Valeur d\'éclat</string>
     <string name="l10n_components_increase_accessibility_0949c0e9">Augmenter %1$s</string>
     <string name="l10n_components_ringfill_59cd4fb9">bagueRemplir</string>
+    <string name="l10n_components_close_bbfa773e">Fermer</string>
+    <string name="l10n_components_copy_af74f7c5">Copier</string>
     <string name="l10n_connection_help_allow_nearby_devices_f7c74880">Permettre aux périphériques à proximité</string>
     <string name="l10n_connection_help_charge_it_and_put_it_on_31b04814">Chargez-le et mettez-le</string>
     <string name="l10n_connection_help_close_the_official_whoop_app_768d7d17">Fermez l\'application officielle WHOOP</string>
@@ -1956,6 +1958,7 @@
     <string name="recording_chip_detail_history_experimental">La synchronisation de l\'historique est expérimentale sur 5.0.</string>
     <string name="recording_chip_detail_connected_no_data">Aucune fréquence cardiaque en direct ni historique synchronisé durant cette session.</string>
     <string name="score_state_title_calibrating">Calibration en cours</string>
+    <string name="l10n_stress_glance_widget_resumes_in_the_morning_a640b49f">Reprend le matin</string>
     <string name="score_state_title_needs_strap">Nécessite le bracelet</string>
     <string name="score_state_title_last_night">La nuit dernière · %1$s</string>
     <string name="score_state_title_latest_sleep">Dernier sommeil · %1$s</string>
@@ -2756,4 +2759,5 @@
     <string name="coach_key_rejected_action">Mettre à jour la clé</string>
     <string name="coach_consent_on">Activé : votre charge, repos, VFC et entraînements sont envoyés au fournisseur, chaque entraînement avec son sport, sa durée, sa distance et sa fréquence cardiaque.</string>
     <string name="coach_consent_off">Désactivé : le coach répond de façon générale et n\'envoie aucune de vos données.</string>
+    <string name="l10n_app_changelog_a_today_screen_you_arrange_yourself_6194ccd0">Un écran Aujourd\'hui que vous composez vous-même, le stress sur l\'écran d\'accueil, et des sauvegardes qui se vérifient elles-mêmes</string>
 </resources>

@@ -1334,6 +1334,8 @@
     <string name="l10n_components_glowring_value_ac0e87de">wartość świecąca</string>
     <string name="l10n_components_increase_accessibility_0949c0e9">Zwiększ %1$s</string>
     <string name="l10n_components_ringfill_59cd4fb9">Wypełnienie pierścienia</string>
+    <string name="l10n_components_close_bbfa773e">Zamknij</string>
+    <string name="l10n_components_copy_af74f7c5">Kopia</string>
     <string name="l10n_connection_help_allow_nearby_devices_f7c74880">Zezwalaj na urządzenia w pobliżu</string>
     <string name="l10n_connection_help_charge_it_and_put_it_on_31b04814">Energia i załóż</string>
     <string name="l10n_connection_help_close_the_official_whoop_app_768d7d17">Zamknij oficjalną aplikację WHOOP</string>
@@ -1923,6 +1925,7 @@
     <string name="recording_chip_detail_history_experimental">Synchronizacja historii jest eksperymentalna w wersji 5.0.</string>
     <string name="recording_chip_detail_connected_no_data">W tej sesji nie ma jeszcze tętna na żywo ani zsynchronizowanej historii.</string>
     <string name="score_state_title_calibrating">Kalibracja</string>
+    <string name="l10n_stress_glance_widget_resumes_in_the_morning_a640b49f">Wznowi się rano</string>
     <string name="score_state_title_needs_strap">Potrzebuje paska</string>
     <string name="score_state_title_last_night">Ostatnia noc · %1$s</string>
     <string name="score_state_title_latest_sleep">Ostatni sen · %1$s</string>
@@ -2761,4 +2764,5 @@
     <string name="coach_key_rejected_action">Zaktualizuj klucz</string>
     <string name="coach_consent_on">Włączone: Twój ładunek, odpoczynek, HRV i treningi trafiają do dostawcy, każdy trening ze sportem, czasem, dystansem i tętnem.</string>
     <string name="coach_consent_off">Wyłączone: coach odpowiada ogólnie i nie wysyła żadnych Twoich danych.</string>
+    <string name="l10n_app_changelog_a_today_screen_you_arrange_yourself_6194ccd0">Ekran Dzisiaj, który układasz sam, stres na ekranie głównym i kopie zapasowe, które same się sprawdzają</string>
 </resources>

@@ -1396,6 +1396,8 @@
     <string name="l10n_components_chunks_chunks_pulled_cec186cf">Получено фрагментов: %1$s</string>
     <string name="l10n_components_decrease_accessibility_df5f1511">Уменьшить %1$s</string>
     <string name="l10n_components_increase_accessibility_0949c0e9">Увеличить %1$s</string>
+    <string name="l10n_components_close_bbfa773e">Закрыть</string>
+    <string name="l10n_components_copy_af74f7c5">Копировать</string>
     <string name="l10n_connection_help_allow_nearby_devices_f7c74880">Разрешить «Устройства поблизости»</string>
     <string name="l10n_connection_help_charge_it_and_put_it_on_31b04814">Зарядите его и наденьте</string>
     <string name="l10n_connection_help_close_the_official_whoop_app_768d7d17">Закройте официальное приложение WHOOP</string>
@@ -1920,6 +1922,7 @@
     <string name="recording_chip_detail_history_experimental">Синхронизация истории экспериментальна на 5.0.</string>
     <string name="recording_chip_detail_connected_no_data">Пока нет ни пульса в реальном времени, ни синхронизированной истории в этой сессии.</string>
     <string name="score_state_title_calibrating">Калибровка</string>
+    <string name="l10n_stress_glance_widget_resumes_in_the_morning_a640b49f">Возобновится утром</string>
     <string name="score_state_title_needs_strap">Нужен ремешок</string>
     <string name="score_state_title_last_night">Прошлая ночь · %1$s</string>
     <string name="score_state_title_latest_sleep">Последний сон · %1$s</string>
@@ -2640,4 +2643,5 @@
     <string name="coach_key_rejected_action">Обновить ключ</string>
     <string name="coach_consent_on">Включено: заряд, отдых, ВСР и тренировки отправляются провайдеру, каждая тренировка с видом спорта, длительностью, дистанцией и пульсом.</string>
     <string name="coach_consent_off">Выключено: коуч отвечает в общем виде и не отправляет ваши показатели.</string>
+    <string name="l10n_app_changelog_a_today_screen_you_arrange_yourself_6194ccd0">Экран «Сегодня», который вы составляете сами, стресс на главном экране и резервные копии, которые проверяют себя сами</string>
 </resources>

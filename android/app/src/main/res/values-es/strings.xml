@@ -1185,6 +1185,8 @@
     <string name="l10n_components_glowring_value_ac0e87de">valor brillante</string>
     <string name="l10n_components_increase_accessibility_0949c0e9">Aumento de %1$s</string>
     <string name="l10n_components_ringfill_59cd4fb9">Anillo</string>
+    <string name="l10n_components_close_bbfa773e">Cerrar</string>
+    <string name="l10n_components_copy_af74f7c5">Copiar</string>
     <string name="l10n_connection_help_allow_nearby_devices_f7c74880">Permitir dispositivos cercanos</string>
     <string name="l10n_connection_help_charge_it_and_put_it_on_31b04814">Cargarlo y ponerlo en</string>
     <string name="l10n_connection_help_close_the_official_whoop_app_768d7d17">Cerrar la aplicación oficial WHOOP</string>
@@ -1938,6 +1940,7 @@
     <string name="recording_chip_detail_history_experimental">La sincronización del historial es experimental en la 5.0.</string>
     <string name="recording_chip_detail_connected_no_data">Aún no hay frecuencia cardíaca en vivo ni historial sincronizado en esta sesión.</string>
     <string name="score_state_title_calibrating">Calibrando</string>
+    <string name="l10n_stress_glance_widget_resumes_in_the_morning_a640b49f">Se reanuda por la mañana</string>
     <string name="score_state_title_needs_strap">Necesita la banda</string>
     <string name="score_state_title_last_night">Anoche · %1$s</string>
     <string name="score_state_title_latest_sleep">Último sueño · %1$s</string>
@@ -2757,4 +2760,5 @@
     <string name="coach_key_rejected_action">Actualizar clave</string>
     <string name="coach_consent_on">Activado: tu carga, descanso, HRV y entrenamientos se envían al proveedor, cada entrenamiento con su deporte, duración, distancia y frecuencia cardíaca.</string>
     <string name="coach_consent_off">Desactivado: el coach responde en general y no envía ninguna de tus métricas.</string>
+    <string name="l10n_app_changelog_a_today_screen_you_arrange_yourself_6194ccd0">Una pantalla de Hoy que organizas tú, el estrés en la pantalla de inicio y copias de seguridad que se comprueban solas</string>
 </resources>

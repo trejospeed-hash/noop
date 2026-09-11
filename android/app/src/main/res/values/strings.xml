@@ -1479,6 +1479,8 @@
     <string name="l10n_components_glowring_value_ac0e87de">glowring-value</string>
     <string name="l10n_components_increase_accessibility_0949c0e9">Increase %1$s</string>
     <string name="l10n_components_ringfill_59cd4fb9">ringFill</string>
+    <string name="l10n_components_close_bbfa773e">Close</string>
+    <string name="l10n_components_copy_af74f7c5">Copy</string>
     <string name="l10n_connection_help_allow_nearby_devices_f7c74880">Allow Nearby devices</string>
     <string name="l10n_connection_help_charge_it_and_put_it_on_31b04814">Charge it and put it on</string>
     <string name="l10n_connection_help_close_the_official_whoop_app_768d7d17">Close the official WHOOP app</string>
@@ -2077,6 +2079,7 @@
     <string name="recording_chip_detail_history_experimental">History sync is experimental on 5.0.</string>
     <string name="recording_chip_detail_connected_no_data">No live heart rate or synced history yet this session.</string>
     <string name="score_state_title_calibrating">Calibrating</string>
+    <string name="l10n_stress_glance_widget_resumes_in_the_morning_a640b49f">Resumes in the morning</string>
     <string name="score_state_title_needs_strap">Needs the strap</string>
     <string name="score_state_title_last_night">Last night · %1$s</string>
     <string name="score_state_title_latest_sleep">Latest sleep · %1$s</string>
@@ -2786,4 +2789,5 @@
     <string name="coach_key_rejected_action">Update key</string>
     <string name="coach_consent_on">On: your charge, rest, HRV and workouts are sent to the provider, each workout with its sport, duration, distance and heart rate.</string>
     <string name="coach_consent_off">Off: the coach answers generally and sends none of your metrics.</string>
+    <string name="l10n_app_changelog_a_today_screen_you_arrange_yourself_6194ccd0">A Today screen you arrange yourself, stress on the home screen, and backups that check themselves</string>
 </resources>

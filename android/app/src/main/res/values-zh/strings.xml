@@ -1324,6 +1324,8 @@
     <string name="l10n_components_glowring_value_ac0e87de">glowring-value</string>
     <string name="l10n_components_increase_accessibility_0949c0e9">增加 %1$s</string>
     <string name="l10n_components_ringfill_59cd4fb9">ringFill</string>
+    <string name="l10n_components_close_bbfa773e">关闭</string>
+    <string name="l10n_components_copy_af74f7c5">复制</string>
     <string name="l10n_connection_help_allow_nearby_devices_f7c74880">允许“附近设备”权限</string>
     <string name="l10n_connection_help_charge_it_and_put_it_on_31b04814">给它充电并佩戴在手腕上</string>
     <string name="l10n_connection_help_close_the_official_whoop_app_768d7d17">从后台彻底关闭 WHOOP 官方 App</string>
@@ -1862,6 +1864,7 @@
     <string name="recording_chip_detail_history_experimental">历史同步在 5.0 上属实验性。</string>
     <string name="recording_chip_detail_connected_no_data">本次连接尚无实时心率或已同步的历史记录。</string>
     <string name="score_state_title_calibrating">校准中</string>
+    <string name="l10n_stress_glance_widget_resumes_in_the_morning_a640b49f">早晨恢复</string>
     <string name="score_state_title_needs_strap">需要手环</string>
     <string name="score_state_title_last_night">昨晚 · %1$s</string>
     <string name="score_state_title_latest_sleep">最近睡眠 · %1$s</string>
@@ -2670,4 +2673,5 @@
     <string name="coach_key_rejected_action">更新密钥</string>
     <string name="coach_consent_on">开启：你的充能、休息、HRV 和训练会发送给服务商，每次训练包含运动类型、时长、距离和心率。</string>
     <string name="coach_consent_off">关闭：教练只作一般性回答，不发送你的任何数据。</string>
+    <string name="l10n_app_changelog_a_today_screen_you_arrange_yourself_6194ccd0">可自行编排的「今天」页面、主屏幕上的压力曲线，以及会自我校验的备份</string>
 </resources>

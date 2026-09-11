@@ -4154,6 +4154,16 @@ class WhoopBleClient(
     @Volatile
     private var whoopIsActiveDevice = true
 
+    /**
+     * Whether a WHOOP is the ACTIVE device, for readouts that must describe the right band (#2075).
+     *
+     * Read-only view of the flag [setWhoopIsActiveDevice] maintains from the coordinator's own start/stop
+     * closures, which derive it from `SourceIdentity.isWhoop` on the active row. Exposed so a producer on
+     * a hot path can ask without a registry read: the widget push rides a collector driven by live heart
+     * rate, and reading the DB there to answer a battery label would be absurd.
+     */
+    val activeDeviceIsWhoop: Boolean get() = whoopIsActiveDevice
+
     /** The last entry point [whoopConnectAllowed] turned away, so a rotation timer cannot flood the log. */
     private var lastBlockedConnectReason: String? = null
 
@@ -6708,7 +6718,7 @@ class WhoopBleClient(
                     // stale backoff timer can't fire and reset+close this connection.
                     cancelPendingReconnect()
                     // #1881: attribute this link to the strap that actually connected, before anything
-                    // persists. Swift twin: `BLEManager.didConnect` -> `adoptSourceIdentity(for:)`.
+                    // persists. Swift twin: `BLEManager.centralManager(_:didConnect:)` -> `adoptSourceIdentity(for:)`.
                     adoptSourceIdentity(runCatching { g.device?.address }.getOrNull())
                     // A successful connect clears the reconnect backoff — the next involuntary drop starts
                     // the 3,6,12…s schedule afresh (iOS didConnect: failedConnectAttempts=0, #48). Reset
@@ -7650,6 +7660,19 @@ class WhoopBleClient(
                                     val p = !isFutureDatedNewest(newestForPending, wallNowP) &&
                                         (newestForPending - f) > AUTO_CONTINUE_BEHIND_GAP_SECONDS
                                     if (_state.value.historyPendingSync != p) {
+                                        // #2012: say WHY, on the flip only. This half of the Rest
+                                        // "Pending sync" state used to change in total silence.
+                                        log(
+                                            PendingSyncDiagnostic.line(
+                                                pending = p,
+                                                site = PendingSyncDiagnostic.SITE_CONNECT,
+                                                newestUnix = newestForPending,
+                                                frontierUnix = f,
+                                                futureDated = isFutureDatedNewest(newestForPending, wallNowP),
+                                                persistedRows = null,
+                                                thresholdSec = AUTO_CONTINUE_BEHIND_GAP_SECONDS,
+                                            ),
+                                        )
                                         _state.value = _state.value.copy(historyPendingSync = p)
                                     }
                                 }
@@ -10578,6 +10601,19 @@ class WhoopBleClient(
                 persistedSensorRows &&
                 (newest - frontier) > AUTO_CONTINUE_BEHIND_GAP_SECONDS
             if (_state.value.historyPendingSync != pending) {
+                // #2012: say WHY, on the flip only (see the connect site).
+                log(
+                    PendingSyncDiagnostic.line(
+                        pending = pending,
+                        site = PendingSyncDiagnostic.SITE_POST_OFFLOAD,
+                        newestUnix = newest,
+                        frontierUnix = frontier,
+                        // Only meaningful with a newest to test; the formatter ignores it without one.
+                        futureDated = newest != null && isFutureDatedNewest(newest, wallNow),
+                        persistedRows = persistedSensorRows,
+                        thresholdSec = AUTO_CONTINUE_BEHIND_GAP_SECONDS,
+                    ),
+                )
                 _state.value = _state.value.copy(historyPendingSync = pending)
             }
             // #266: local only — NOT cached on the instance. A future-dated newest (#1012) makes the
@@ -11834,6 +11870,16 @@ private val PII_ADOPTED_ID_NOOP_RE = Regex("whoop-([A-Za-z0-9]{3})[A-Za-z0-9-]{3
 private val PII_ADOPTED_ID_RE = Regex("whoop-([A-Za-z0-9]{3})[A-Za-z0-9-]{3,}")
 
 /**
+ * #2092: an Oura device id (`oura-<serial>`) is the same #1303 gap as [PII_ADOPTED_ID_RE], for the OTHER
+ * brand. Neither WHOOP rule above matches it, since the prefix isn't "whoop-". Exact same shape (3-char
+ * prefix + "…", matching [com.noop.data.OuraSerialIdentity.logSafe]) and the same `-noop`-suffix
+ * pair, since the computed-sibling suffix is brand-agnostic — an Oura device gets a `oura-<serial>-noop`
+ * sibling the same way a WHOOP strap does.
+ */
+private val PII_OURA_ADOPTED_ID_NOOP_RE = Regex("oura-([A-Za-z0-9]{3})[A-Za-z0-9-]{3,}(-noop)")
+private val PII_OURA_ADOPTED_ID_RE = Regex("oura-([A-Za-z0-9]{3})[A-Za-z0-9-]{3,}")
+
+/**
  * Builds the 9-byte WHOOP 4.0 SET_ALARM_TIME (cmd 66) payload.
  * Layout: `[0x01] + u32 LE epoch + [0x00, 0x00]` subseconds + `[0x00, 0x00]` haptic-mode field.
  *
@@ -12072,6 +12118,10 @@ internal fun redactStrapLogPii(s: String): String = try {
         // for an adopted id. The -noop form runs before the general one so the sibling suffix survives.
         .replace(PII_ADOPTED_ID_NOOP_RE, "whoop-$1…$2")
         .replace(PII_ADOPTED_ID_RE, "whoop-$1…")
+        // #2092: the Oura twin of the two rules above. Order vs. the WHOOP pair is not load-bearing - the
+        // two prefixes never overlap.
+        .replace(PII_OURA_ADOPTED_ID_NOOP_RE, "oura-$1…$2")
+        .replace(PII_OURA_ADOPTED_ID_RE, "oura-$1…")
         // Last: the name rule keys on literal text no earlier rule produces or consumes, so it neither
         // masks a substitution marker nor depends on one.
         .replace(PII_DEVICE_NAME_RE, "<name>$1")
