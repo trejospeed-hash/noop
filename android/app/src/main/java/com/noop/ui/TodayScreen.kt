@@ -263,6 +263,9 @@ private data class TodayLiveSnapshot(
      *  most once per connection, so it costs the snapshot nothing. */
     val historyReady: Boolean,
     val historySyncExperimental: Boolean,
+    /** #689/#815: the connect-time GET_DATA_RANGE backlog sample, when known. Set once per connection,
+     *  so it adds no per-tick churn to this snapshot. */
+    val pagesBehindAtConnect: Int?,
     val batteryPct: Double?,
     /** True once a WHOOP 5/MG strap has been seen this session, picks the 5/MG rated-life fallback for the
      *  battery runtime estimate (#713). Changes at most once per connection, so it doesn't reintroduce the
@@ -347,6 +350,7 @@ fun TodayScreen(
                 syncChunksThisSession = s.syncChunksThisSession,
                 historyReady = s.historyReady,
                 historySyncExperimental = s.historySyncExperimental,
+                pagesBehindAtConnect = s.pagesBehindAtConnect,
                 batteryPct = s.batteryPct,
                 whoop5 = s.whoop5Detected,
                 charging = s.charging,
@@ -1338,44 +1342,36 @@ fun TodayScreen(
                 syncChunksThisSession = liveSnap.syncChunksThisSession,
                 lastSyncAt = liveSnap.lastSyncAt,
                 historySyncExperimental = liveSnap.historySyncExperimental,
+                pagesBehindAtConnect = liveSnap.pagesBehindAtConnect,
                 onPickDay = { offset -> selectedDayOffset = offset },
                 onQuickActions = onQuickActions,
                 onOpenSettings = onOpenSettings,
                 onOpenDevices = onOpenDevices,
             )
             // WORDMARK (iOS LiquidWordmark parity): a subtle centred "N O O P" @ ~50% opacity, with a
-            // tap easter egg. Shares its row with the Arrange affordance — wordmark centred, Arrange
-            // aligned to the trailing edge — so neither needs its own empty band.
-            Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-                LiquidWordmark()
-                // One consistent customization affordance for section order and visibility.
-                //
-                // #2008: reported as "not visible". It was not hidden, it was unreadable as a control:
-                // #486 folded it out of its own pinned row onto the wordmark row, and it kept the
-                // TERTIARY text colour, so the one affordance for rearranging Today sat at the dimmest
-                // tier in the palette beside a decorative 50%-opacity wordmark. Nothing said "button".
-                //
-                // The compact row #486 wanted is kept. What changes is that it now reads as a control:
-                // secondary text on a frosted pill, which is the idiom the rest of Today uses for a
-                // tappable surface. iOS has never had this problem, its twin is a proper header button
-                // (`nativeLiquidGlassHeaderButton`) at a fixed control size.
-                TextButton(
-                    onClick = { showLayoutEditor = true },
-                    colors = ButtonDefaults.textButtonColors(contentColor = Palette.textSecondary),
-                    contentPadding = PaddingValues(horizontal = Metrics.space10, vertical = Metrics.space4),
-                    modifier = Modifier
-                        .align(Alignment.CenterEnd)
-                        .clip(RoundedCornerShape(50))
-                        .frostedCardSurface(cornerRadius = 999.dp),
-                ) {
-                    Icon(
-                        Icons.Filled.Tune,
-                        contentDescription = stringResource(R.string.today_customize_title),
-                        modifier = Modifier.size(Metrics.iconSmall),
-                    )
-                    Spacer(Modifier.width(Metrics.space4))
-                    Text(stringResource(R.string.today_customize_action), style = NoopType.footnote)
+            // tap easter egg. Still shares its row with the customization control, as #486 intended,
+            // but in a slot of its own rather than underneath it.
+            //
+            // #2110: the wordmark and the control used to share this row as a BOX (#486), wordmark centred
+            // and the control aligned CenterEnd. A Box stacks its children, so nothing reserved space or
+            // shortened the wordmark — the two simply overlapped once the control grew wide enough to reach
+            // the centre. #2010 grew it (icon + label + padding + a frosted pill) and the trailing "P"
+            // disappeared underneath it, worse per locale since the label runs 3 chars in zh to 13 in fr
+            // against the 9 it was eyeballed at.
+            //
+            // A ROW with equal fixed gutters instead of a Box: the leading Spacer mirrors the trailing
+            // control exactly, so the wordmark stays optically centred while owning the space BETWEEN them.
+            // Overlap is now unexpressible at any label width, in any locale, because the two occupy
+            // different slots rather than the same one.
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Spacer(Modifier.size(HeaderClusterControl))
+                Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                    LiquidWordmark()
                 }
+                CustomizeDisc(onClick = { showLayoutEditor = true })
             }
         }
         }
@@ -2190,6 +2186,50 @@ private fun TodayCardDismissButton(onClick: () -> Unit, modifier: Modifier = Mod
     }
 }
 
+/** Customize Today (#2110): section order and visibility, on the trailing edge of the wordmark row.
+ *
+ *  Icon-only at the shared header-control size. The glyph and the accessibility-label-instead-of-text
+ *  treatment are iOS's (`slider.horizontal.3` in a `nativeLiquidGlassHeaderButton`), but the PLACEMENT
+ *  deliberately is not: iOS keeps this in the header control cluster, and Android cannot afford it
+ *  there. See the cluster comment in `LiquidTodayHeader` — Android's cluster already carries a sync
+ *  chip iOS has no equivalent of, and lacks iOS's measured title fade, so a control added there is
+ *  width taken straight from the day title.
+ *
+ *  Icon-only is what answers BOTH reports: it still reads as a control (#2008 found the old tertiary
+ *  text unreadable as one) while no longer out-shouting the hero rings (#2110), and dropping the
+ *  visible label retires the locale-width problem, since the word ran 3 characters in zh to 13 in fr.
+ *
+ *  No new string: the existing "Customize Today" title is the accessibility label, so this ships in
+ *  every locale that already had it. */
+@Composable
+private fun CustomizeDisc(onClick: () -> Unit) {
+    val interaction = remember { MutableInteractionSource() }
+    Box(
+        modifier = Modifier
+            // Level with the avatar / + / battery ring (shared size), so the cluster reads as one row.
+            .size(HeaderClusterControl)
+            .liquidPress(interaction)
+            .clip(CircleShape)
+            // The same translucent-white disc the + uses, rather than the frosted card surface #2010
+            // reached for: the point is to look like its siblings, not like a call to action.
+            .background(Color.White.copy(alpha = 0.16f))
+            .clickable(
+                interactionSource = interaction,
+                indication = null,
+                onClick = onClick,
+            )
+            .semantics { contentDescription = uiString(R.string.today_customize_title) },
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            Icons.Filled.Tune,
+            contentDescription = null,
+            tint = Color.White,
+            modifier = Modifier.size(16.dp),
+        )
+    }
+}
+
 @Composable
 private fun QuickActionDisc(onClick: () -> Unit) {
     val interaction = remember { MutableInteractionSource() }
@@ -2320,6 +2360,8 @@ private fun LiquidTodayHeader(
     syncChunksThisSession: Int = 0,
     lastSyncAt: Long? = null,
     historySyncExperimental: Boolean = false,
+    // #689/#815: the connect-time backlog sample, when known.
+    pagesBehindAtConnect: Int? = null,
     onPickDay: (Int) -> Unit,
     onQuickActions: () -> Unit,
     onOpenSettings: () -> Unit,
@@ -2399,6 +2441,14 @@ private fun LiquidTodayHeader(
         }
 
         // RIGHT: the controls, in order — [sync chip] · avatar · + · battery ring. Each ~36dp, 8dp apart.
+        //
+        // #2110: deliberately NOT where the Customize control went, even though that is where iOS keeps it.
+        // The title Column beside this is weight(1f) with maxLines=1 + Ellipsis, so every control added here
+        // is width taken from the day title, and Android starts from a wider cluster than iOS because of the
+        // sync chip iOS has no equivalent of. iOS can afford its fourth control because it fades the title
+        // under a MEASURED cluster width (headerTrailingControlFadeMask); Android has no such reserve. On a
+        // 393dp phone a fifth control leaves the 28sp title ~117dp, and "Yesterday" needs ~139dp, so it
+        // would have started ellipsizing a day title that fits today.
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -2409,6 +2459,7 @@ private fun LiquidTodayHeader(
             SyncStatusChip(
                 backfilling = backfilling, chunks = syncChunksThisSession,
                 lastSyncAt = lastSyncAt, historySyncExperimental = historySyncExperimental,
+                pagesBehind = pagesBehindAtConnect,
             )
             // (a) Profile avatar (the photo set in Settings, or the NOOP loop mark) → Settings. Mirrors iOS.
             Box(
@@ -2447,6 +2498,7 @@ private fun SyncStatusChip(
     chunks: Int,
     lastSyncAt: Long?,
     historySyncExperimental: Boolean,
+    pagesBehind: Int? = null,
 ) {
     // The clock and the translated "now" word are resolved HERE, in the composable that already depends
     // on both, and handed down — so `SyncChipState.resolve` stays a genuinely pure decision that a plain
@@ -2458,11 +2510,28 @@ private fun SyncStatusChip(
         lastSyncAtSec = lastSyncAt,
         historySyncExperimental = historySyncExperimental,
         nowSec = System.currentTimeMillis() / 1000L,
+        pagesBehind = pagesBehind,
     )
     when (state) {
-        is SyncChipState.Syncing -> ChipCapsule(
-            Icons.Filled.Autorenew, "${state.chunks}", Palette.accent,
-            uiString(R.string.l10n_today_screen_sync_chip_syncing_desc_bfc290e7, state.chunks))
+        is SyncChipState.Syncing -> {
+            // Both counts are inflected, so "1 chunk" and "1 page" read correctly. Android <plurals>
+            // inflects one quantity per resource, so each count resolves separately and a template
+            // sentence joins them — the joiner sits inside the template, never on a resource edge,
+            // because aapt2 strips edge whitespace (#2041).
+            val chunksText = uiPlural(R.plurals.sync_chip_chunks_count, state.chunks, state.chunks)
+            val pagesText = state.pagesBehind?.let {
+                uiPlural(R.plurals.sync_chip_pages_behind_count, it, it)
+            }
+            ChipCapsule(
+                Icons.Filled.Autorenew, "${state.chunks}", Palette.accent,
+                desc = if (pagesText != null) {
+                    uiString(R.string.l10n_today_screen_sync_chip_syncing_pages_desc_ad763b39, chunksText, pagesText)
+                } else {
+                    uiString(R.string.l10n_today_screen_sync_chip_syncing_desc_92daf60c, chunksText)
+                },
+                detail = pagesText,
+            )
+        }
         is SyncChipState.Synced -> ChipCapsule(
             Icons.Filled.Check, state.agoText, Palette.textSecondary,
             uiString(R.string.l10n_today_screen_sync_chip_synced_desc_4d255944, state.agoText))
@@ -2476,7 +2545,7 @@ private fun SyncStatusChip(
 
 /** The shared sync-chip capsule (icon + terse label). Twin of the iOS `SyncStatusChip.chip`. */
 @Composable
-private fun ChipCapsule(icon: ImageVector, text: String, tint: Color, desc: String) {
+private fun ChipCapsule(icon: ImageVector, text: String, tint: Color, desc: String, detail: String? = null) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp),
@@ -2490,6 +2559,19 @@ private fun ChipCapsule(icon: ImageVector, text: String, tint: Color, desc: Stri
     ) {
         Icon(icon, contentDescription = desc, tint = tint, modifier = Modifier.size(14.dp))
         Text(text, style = NoopType.caption, color = tint)
+        // #689/#815: the optional secondary line (the backlog figure). Dimmer than the count it follows,
+        // because the count is the live thing and this is a fixed sample taken at connect. maxLines = 1
+        // with ellipsis so a long localisation cannot push the header cluster off a narrow screen
+        // (#1835); the accessibility description carries the full sentence either way.
+        if (detail != null) {
+            Text(
+                detail,
+                style = NoopType.caption,
+                color = Palette.textSecondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
     }
 }
 
@@ -3587,12 +3669,32 @@ private fun HostedCardsSection(
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    // Clipped to the card's own radius BEFORE the click. `NoopCard` clips itself, but
-                    // the ripple draws on this wrapper, so without matching the shape here it would wash
-                    // square corners over a rounded card. `Metrics.cardRadius` is the right figure
-                    // because every hosted card renders through `NoopCard`: the 26dp liquid-hero
-                    // surface `ChartCard` can wear is hero-only, and none of these opt into it.
-                    .clip(RoundedCornerShape(Metrics.cardRadius))
+                    // Clipped BEFORE the click. `NoopCard` clips itself, but the ripple draws on this
+                    // wrapper, so without matching the shape here it would wash square corners over a
+                    // rounded card. `Metrics.cardRadius` is the right figure: the 26dp liquid-hero surface
+                    // `ChartCard` can wear is hero-only, and none of these opt into it.
+                    //
+                    // This used to read "because every hosted card renders through NoopCard", and that was
+                    // the bug (#2109). Six of them open with a bare section header instead, and the clip
+                    // was cutting its first glyph. The shape is asked for per card now.
+                    .clip(
+                        // #2109: shaped from the card's own opening, not assumed. A card that FILLS this
+                        // slot wants the full radius. A card that opens with a bare section header does
+                        // not: its first pixel is heading text at the top-left, where an 18dp corner cuts
+                        // hardest at y=0, and the radius clipped the overline's first glyph ("LAST NIGHT"
+                        // read as "AST NIGHT"). Square the TOP corners for those and keep the bottom
+                        // rounded, because the slot's bottom edge IS the inner card's bottom edge and a
+                        // square ripple there would wash its corners, which is the defect the clip was
+                        // added for in the first place.
+                        if (card.leadsWithSectionHeader) {
+                            RoundedCornerShape(
+                                topStart = 0.dp, topEnd = 0.dp,
+                                bottomStart = Metrics.cardRadius, bottomEnd = Metrics.cardRadius,
+                            )
+                        } else {
+                            RoundedCornerShape(Metrics.cardRadius)
+                        }
+                    )
                     .then(if (open != null) Modifier.clickable(onClick = open) else Modifier),
             ) {
             when (card) {
