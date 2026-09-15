@@ -827,10 +827,11 @@ class _NumberExpression:
         token = self._take()
         if not NUMBER_TOKEN.fullmatch(token):
             raise InvalidOperation
-        number = token.replace("_", "").rstrip("fFdDlL")
+        number = token.replace("_", "")
         if number.lower().startswith(("0x", "0b", "0o")):
-            return Decimal(int(number, 0))
-        return Decimal(number)
+            # f/F/d/D are hex digits here; radix literals only take the l/L suffix.
+            return Decimal(int(number.rstrip("lL"), 0))
+        return Decimal(number.rstrip("fFdDlL"))
 
     def _peek(self) -> str | None:
         return self.tokens[self.index] if self.index < len(self.tokens) else None
@@ -2620,7 +2621,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bootstrap-map", action="store_true", help="write a fresh inventory map before scanning")
     parser.add_argument("--write-baseline", action="store_true", help="rewrite the baseline with current findings")
     parser.add_argument("--refresh-derived", action="store_true", help="refresh existing derived snapshots only if the ratchet accepts the result")
+    parser.add_argument(
+        "--repair-stale-base",
+        action="store_true",
+        help="with --refresh-derived, repair metadata drift already present in the exact base",
+    )
     parser.add_argument("--base", default="origin/main", help="exact git ref used to prove debt reductions")
+    parser.add_argument(
+        "--migrate-authority",
+        action="store_true",
+        help="re-base onto a freshly derived base authority when the base's stored one cannot be "
+             "reproduced; new debt still requires issue-bound dispositions",
+    )
     args = parser.parse_args(argv)
 
     root = args.root.resolve()
@@ -2628,6 +2640,15 @@ def main(argv: list[str] | None = None) -> int:
     baseline_path = args.baseline_path or root / "Tools/parity_ledger_baseline.json"
     if args.bootstrap_map != args.write_baseline:
         print("FAIL --bootstrap-map and --write-baseline must be used together")
+        return 2
+    if args.repair_stale_base and not args.refresh_derived:
+        print("FAIL --repair-stale-base requires --refresh-derived")
+        return 2
+    if args.migrate_authority and not args.refresh_derived:
+        print("FAIL --migrate-authority requires --refresh-derived")
+        return 2
+    if args.migrate_authority and args.repair_stale_base:
+        print("FAIL --repair-stale-base and --migrate-authority are different remedies; use one")
         return 2
     if args.refresh_derived:
         if args.bootstrap_map or args.write_baseline or args.no_baseline:
@@ -2654,6 +2675,10 @@ def main(argv: list[str] | None = None) -> int:
                 sys.executable, str(Path(__file__).with_name("parity_ratchet.py")),
                 "--root", str(root), "--base", args.base, "--offline",
             ]
+            if args.repair_stale_base:
+                command.append("--repair-stale-base")
+            if args.migrate_authority:
+                command.append("--migrate-authority")
             completed = subprocess.run(command, cwd=root, text=True, capture_output=True)
             if completed.returncode:
                 print("FAIL derived refresh rejected; snapshots restored")
