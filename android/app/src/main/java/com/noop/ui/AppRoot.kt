@@ -155,6 +155,10 @@ internal enum class Destination(
 
     // Group: Insight
     Coach("coach", R.string.nav_coach, Icons.Filled.AutoAwesome),
+    // Coach settings (#2243), reached ONLY from the strip on the Coach page, so like [CoupledView]
+    // it is deliberately absent from every [DrawerGroup]: the drawer groups mirror the iOS More list
+    // one-for-one, and the iOS twin hangs off Coach in the same way.
+    CoachSettings("coach_settings", R.string.coach_settings, Icons.Filled.Tune),
     InsightsHub("insights_hub", R.string.nav_insights_hub, Icons.Filled.Insights),
     Insights("insights", R.string.nav_insights, Icons.Filled.Insights),
     Explore("explore", R.string.nav_explore, Icons.Filled.Explore),
@@ -439,10 +443,47 @@ object BottomBarStyleStore {
             .putBoolean(NoopPrefs.KEY_BOTTOM_BAR_AUTO_HIDE, value).apply()
     }
 
+    /**
+     * Whether the AI Coach is offered at all. Default ON, so every existing install is unchanged.
+     *
+     * Lives here rather than being read straight from prefs at the call site because the bar has to
+     * RECOMPOSE when it flips: a plain `NoopPrefs.coachEnabled(ctx)` read inside the bar would be a
+     * snapshot taken once, and the tab would not appear or vanish until the next process start.
+     */
+    var coachEnabled by mutableStateOf(true)
+        private set
+
+    /**
+     * Flip the Coach master switch.
+     *
+     * Cancels the daily brief here rather than leaving each surface to notice, because the brief is the
+     * one Coach surface that runs with no UI attached: it is a separate default-off feature with its own
+     * `enabled` flag that calls a provider from the background and posts a notification. Hiding the tab
+     * alone would leave a wearer who had switched briefs on still getting AI output from a feature they
+     * had just turned off.
+     *
+     * Called in BOTH directions. `reschedule` already reads the master switch first and the brief's own
+     * flag second, so off cancels the work and clears the widget, and on re-arms it only if the wearer
+     * had briefs switched on. Doing this on the flip rather than leaving it to the next app start (where
+     * MainActivity reschedules anyway) keeps the brief's own settings row honest: it would otherwise read
+     * ON while nothing was scheduled, until something happened to relaunch the app.
+     */
+    fun setCoachEnabled(ctx: Context, value: Boolean) {
+        coachEnabled = value
+        val app = ctx.applicationContext
+        NoopPrefs.setCoachEnabled(app, value)
+        // Routed through `reschedule` rather than `cancel`, because cancelling the work is only half of
+        // switching the brief off: the widget keeps displaying the LAST generated brief, which is AI output
+        // still on the wearer's home screen after they turned the AI off. `reschedule` sees the master
+        // switch and does the right thing in both directions, so this is unconditional.
+        CoachBriefScheduler.reschedule(app)
+    }
+
     fun load(ctx: Context) {
         val prefs = NoopPrefs.of(ctx.applicationContext)
         overlay = prefs.getBoolean(NoopPrefs.KEY_OVERLAY_BOTTOM_BAR, true)
         autoHide = prefs.getBoolean(NoopPrefs.KEY_BOTTOM_BAR_AUTO_HIDE, true)
+        coachEnabled = NoopPrefs.coachEnabled(ctx.applicationContext)
         // Both are read through the same clamps the setters use, so a hand-edited or downgraded pref
         // cannot put the bar in a state the UI has no way to leave.
         opacityStep = prefs.getInt(NoopPrefs.KEY_BOTTOM_BAR_OPACITY_STEP, DEFAULT_OPACITY_STEP)
@@ -652,7 +693,23 @@ fun AppRoot(viewModel: AppViewModel = viewModel()) {
                 }
                 composable(Destination.Intervals.route) { IntervalsScreen(viewModel) }
                 composable(Destination.Breathe.route) { BreatheScreen(viewModel) }
-                composable(Destination.Coach.route) { CoachScreen() }
+                composable(Destination.Coach.route) {
+                    // A normal push, so Back returns to the conversation (#2243).
+                    CoachScreen(onOpenSettings = { nav.navigate(Destination.CoachSettings.route) })
+                }
+                composable(Destination.CoachSettings.route) {
+                    // The SAME CoachViewModel the conversation is using, not a fresh one.
+                    // `viewModel()` resolves against LocalViewModelStoreOwner, which under
+                    // Navigation Compose is the NavBackStackEntry, so the default would hand this
+                    // destination its own instance. CoachViewModel keeps consent in memory
+                    // (`_consent`, seeded once at construction) and `send` passes that value to
+                    // `chatStream`, so a revoke made against a second instance would persist to
+                    // storage and still leave the conversation sending on the old one until its
+                    // entry was destroyed. Coach is always below this on the back stack: this
+                    // destination is reachable only from the strip on that screen.
+                    val coachEntry = remember(it) { nav.getBackStackEntry(Destination.Coach.route) }
+                    CoachSettingsScreen(vm = viewModel(coachEntry))
+                }
                 composable(Destination.Explore.route) { TrendsExploreScreen(viewModel) }
                 composable(Destination.Automations.route) { AutomationsScreen(viewModel) }
                 composable(Destination.SmartAlarm.route) { SmartAlarmScreen(viewModel) }
@@ -1057,6 +1114,10 @@ internal val barLeadingTabs = listOf(
     // chart.line.uptrend.xyaxis on iOS — the rising-trend glyph, not a flat bar chart.
     BarTab(Destination.Trends, Icons.AutoMirrored.Filled.TrendingUp, R.string.nav_trends),
 )
+/**
+ * The trailing tabs, as shipped. [barTrailingTabsFor] is what the bar actually draws: Coach is
+ * conditional, so this list is the full set rather than the visible one.
+ */
 internal val barTrailingTabs = listOf(
     BarTab(Destination.Sleep, Icons.Filled.Bedtime, R.string.nav_sleep),
     // #2218: Coach was promoted to a top-level tab on iOS and this side did not follow, so it sat in
@@ -1066,12 +1127,26 @@ internal val barTrailingTabs = listOf(
     BarTab(Destination.Coach, Icons.Filled.AutoAwesome, R.string.nav_coach),
 )
 
+/**
+ * The trailing tabs to draw for a given Coach setting.
+ *
+ * A function rather than a filter written inline at the bar so the Kotlin unit tests can assert the
+ * two shapes directly, and so every surface that needs "which tabs are there" agrees by construction
+ * instead of by two copies of the same predicate.
+ */
+internal fun barTrailingTabsFor(coachEnabled: Boolean): List<BarTab> =
+    if (coachEnabled) barTrailingTabs else barTrailingTabs.filterNot { it.dest == Destination.Coach }
+
 @Composable
 private fun GlassBottomBar(
     current: Destination,
     onTabSelected: (Destination) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    // One binding, used by BOTH the slots and the More-lit predicate below. #2218's note applies here
+    // twice over: a second copy of "which tabs exist" is what let Coach light two slots at once, and a
+    // conditional tab makes that failure available again to anyone who filters in one place only.
+    val visibleTrailing = barTrailingTabsFor(BottomBarStyleStore.coachEnabled)
     val barShape = RoundedCornerShape(50)
     Box(
         modifier = modifier
@@ -1120,7 +1195,7 @@ private fun GlassBottomBar(
                         onClick = { onTabSelected(tab.dest) },
                     )
                 }
-                barTrailingTabs.forEach { tab ->
+                visibleTrailing.forEach { tab ->
                     BarSlot(
                         icon = tab.icon,
                         label = stringResource(tab.labelRes),
@@ -1140,7 +1215,7 @@ private fun GlassBottomBar(
                     // is what made adding Coach a two-part change: the slot alone would have lit Coach
                     // AND More together, because this predicate had never heard of it. (#2218)
                     active = barLeadingTabs.none { it.dest == current } &&
-                        barTrailingTabs.none { it.dest == current },
+                        visibleTrailing.none { it.dest == current },
                     modifier = Modifier.weight(1f),
                     onClick = { onTabSelected(Destination.More) },
                 )
