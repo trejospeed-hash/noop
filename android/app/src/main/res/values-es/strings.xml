@@ -2219,6 +2219,7 @@
     <string name="today_how_score_generic">Cómo se calcula esta puntuación</string>
     <string name="today_strap_battery">Batería de la pulsera</string>
     <string name="today_strap_battery_percent">Batería de la pulsera: %1$d por ciento</string>
+    <string name="today_ring_battery_percent">Batería del anillo: %1$d por ciento</string>
     <string name="today_score_solid">SÓLIDO</string>
     <string name="today_charge_carried">Carga · %1$s</string>
     <string name="today_recovery_carried">Recuperación · %1$s</string>
@@ -2816,4 +2817,7 @@
     <string name="l10n_settings_screen_softer_9edfeba1">Más suave</string>
     <string name="oura_notify_mask_full_title">Máscara de notificación Oura ff (experimental)</string>
     <string name="oura_notify_mask_full_desc">Envía la máscara SetNotification de la aplicación oficial (1c 01 ff) en lugar del 3f de NOOP en la próxima conexión. El anillo agrupa ~10 paquetes por notificación para la aplicación oficial y uno para NOOP (descarga 9× más lenta); este es el primer interruptor candidato. Desactivado por defecto; la conexión siguiente a desactivarlo vuelve a 3f. Busca «-> notify_all(ff)» en el registro de la pulsera y compara los tamaños de notificación en la captura sin procesar.</string>
+    <string name="data_sources_whoop_live_subtitle">Se empareja directamente con tu pulsera por Bluetooth: sin app de WHOOP, sin nube. La pulsera también puede anunciar su frecuencia cardíaca como un sensor Bluetooth estándar.</string>
+    <string name="data_sources_band_broadcast_description">Difunde por Bluetooth la frecuencia cardíaca en vivo de la propia pulsera para Garmin, Zwift o equipos de gimnasio.</string>
+    <string name="whoop4_direct_broadcast_explainer">Tu WHOOP 4.0 puede transmitir la frecuencia cardíaca directamente. Abre Fuentes de datos y usa «Transmitir frecuencia cardíaca desde la pulsera» para Zwift, Peloton, Garmin o equipos de gimnasio. También puedes usar «Transmitir FC desde este teléfono» cuando sea necesario.</string>
 </resources>
